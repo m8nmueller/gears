@@ -246,7 +246,7 @@ object Channel:
         if !isClosed then cells.dropReader(k)
     }
     override final def sendSource(x: T): Source[SendResult] = CanSend(x)
-    override final def close(): Unit =
+    override def close(): Unit =
       synchronized:
         if !isClosed then
           isClosed = true

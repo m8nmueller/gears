@@ -1,13 +1,10 @@
-package gears.async
+package gears.async.stream
 
-import gears.async.SendableChannel
 import gears.async.Async
-import gears.async.ReadableChannel
-import gears.async.BufferedChannel
 import gears.async.Future
 import scala.annotation.targetName
 
-opaque type Stream[+Out] = SendableChannel[Out] => List[Async ?=> Unit]
+opaque type Stream[+Out] = SendableStreamChannel[Out] => List[Async ?=> Unit]
 
 /** A (cold) stream is constructed in three stages:
   *   - The [[Stream]] instance is created given a curried function of a channel (to write to) and an async capability
@@ -18,10 +15,10 @@ opaque type Stream[+Out] = SendableChannel[Out] => List[Async ?=> Unit]
   * This three-step process is embodied in the type of the [[apply]] function.
   */
 object Stream:
-  opaque type Flow[-In, +Out] = (ReadableChannel[In], SendableChannel[Out]) => List[Async ?=> Unit]
-  opaque type ChannelFactory = [T] => () => Channel[T]
+  opaque type Flow[-In, +Out] = (ReadableStreamChannel[In], SendableStreamChannel[Out]) => List[Async ?=> Unit]
+  opaque type ChannelFactory = [T] => () => StreamChannel[T]
 
-  inline def apply[Out](inline fn: SendableChannel[Out] => Async ?=> Unit): Stream[Out] = { ch => List(fn(ch)) }
+  inline def apply[Out](inline fn: SendableStreamChannel[Out] => Async ?=> Unit): Stream[Out] = { ch => List(fn(ch)) }
 
   extension [Out](src: Stream[Out])
     @targetName("throughFlow")
@@ -34,7 +31,7 @@ object Stream:
       }
 
     def through[NewOut](
-        flow: (ReadableChannel[Out], SendableChannel[NewOut]) => Async ?=> Unit
+        flow: (ReadableStreamChannel[Out], SendableStreamChannel[NewOut]) => Async ?=> Unit
     )(using fac: ChannelFactory): Stream[NewOut] =
       val ch = fac[Out]()
       val srcTasks = src(ch)
@@ -43,21 +40,23 @@ object Stream:
         flowTask :: srcTasks
       }
 
-    def run[T](handler: ReadableChannel[Out] => Async ?=> T)(using fac: ChannelFactory)(using Async): T =
+    def run[T](handler: ReadableStreamChannel[Out] => Async ?=> T)(using fac: ChannelFactory)(using Async): T =
       val ch = fac[Out]()
       val tasks = src(ch)
       Async.group:
         tasks.foreach(Future(_))
         handler(ch)
 
+  end extension // Stream
+
   object ChannelFactory {
-    given default: ChannelFactory = { [T] => () => BufferedChannel[T](10) }
-    inline def apply(inline fac: [T] => () => Channel[T]): ChannelFactory = fac
+    given default: ChannelFactory = { [T] => () => BufferedStreamChannel[T](10) }
+    inline def apply(inline fac: [T] => () => StreamChannel[T]): ChannelFactory = fac
   }
 
   object Flow:
     inline def apply[In, Out](
-        inline fn: (ReadableChannel[In], SendableChannel[Out]) => Async ?=> Unit
+        inline fn: (ReadableStreamChannel[In], SendableStreamChannel[Out]) => Async ?=> Unit
     ): Flow[In, Out] = { (ch1, ch2) =>
       List(fn(ch1, ch2))
     }
@@ -73,7 +72,7 @@ object Stream:
       }
 
     def through[NewOut](
-        flow: (ReadableChannel[Out], SendableChannel[NewOut]) => Async ?=> Unit
+        flow: (ReadableStreamChannel[Out], SendableStreamChannel[NewOut]) => Async ?=> Unit
     )(using fac: ChannelFactory): Flow[In, NewOut] =
       val ch = fac[Out]()
       { (in, out) =>
@@ -81,3 +80,4 @@ object Stream:
         val flowTasks: Async ?=> Unit = flow(ch, out)
         flowTasks :: flow0Tasks
       }
+  end extension // Flow

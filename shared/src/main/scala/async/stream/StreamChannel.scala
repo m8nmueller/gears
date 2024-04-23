@@ -8,11 +8,30 @@ import java.util.concurrent.locks.ReentrantReadWriteLock
 import gears.async.Listener
 import gears.async.Channel.Res
 import gears.async.Async
+import gears.async.SourceUtil
+import scala.util.Try
+import scala.util.Success
+import scala.util.Failure
 
 enum StreamResult[+T]:
   case Closed
   case Failed(val exception: Throwable)
   case Data(val data: T)
+
+object StreamResult:
+  type Terminated = StreamResult.Closed.type | StreamResult.Failed[?]
+
+  extension (t: Terminated)
+    /** Convert the termination message to a [[Try]]. It matches [[StreamResult.Closed]] to [[Success]] and
+      * [[StreamResult.Failed]] to [[Failure]] containing the given throwable.
+      *
+      * @return
+      *   a try representation of this termination state
+      */
+    def toTerminationTry(): Try[Unit] =
+      t match
+        case Closed            => Success(())
+        case Failed(exception) => Failure(exception)
 
 trait SendableStreamChannel[-T] extends SendableChannel[T], java.io.Closeable:
   /** Terminate the channel with a given termination value. No more send operations (using [[sendSource]] or [[send]])
@@ -24,7 +43,7 @@ trait SendableStreamChannel[-T] extends SendableChannel[T], java.io.Closeable:
     * @return
     *   true iff this channel was terminated by that call with the given value
     */
-  def terminate(value: StreamResult.Closed.type | StreamResult.Failed[?]): Boolean
+  def terminate(value: StreamResult.Terminated): Boolean
 
   /** Close the channel now. Does nothing if the channel is already terminated.
     */
@@ -36,6 +55,111 @@ trait SendableStreamChannel[-T] extends SendableChannel[T], java.io.Closeable:
     *   the exception that will constitute the termination value
     */
   def fail(exception: Throwable): Unit = terminate(StreamResult.Failed(exception))
+
+object SendableStreamChannel:
+  /** Create a send-only channel that will accept any element immediately and pass it to a given handler. It
+    * synchronizes access to the handler so that the handler will never be called multiple times in parallel. When the
+    * [[SendableStreamChannel]] is terminated, the handler receives the termination value once. It will not be called
+    * again afterwards.
+    *
+    * The handler is run synchronously on the sender's thread.
+    *
+    * @param handler
+    *   a function to run when an element is sent on the channel or the channel is terminated
+    * @return
+    *   a new sending end of a stream channel that redirects the data to the given callback
+    */
+  def fromCallback[T](handler: StreamResult[T] => Unit): SendableStreamChannel[T] =
+    new SendableStreamChannel[T]:
+      var open = true
+
+      override def sendSource(x: T): Async.Source[Res[Unit]] =
+        new Async.Source[Res[Unit]]:
+          override def poll(k: Listener[Res[Unit]]): Boolean =
+            if k.acquireLock() then
+              synchronized:
+                if open then
+                  handler(StreamResult.Data(x))
+                  k.complete(Right(()), this)
+                else k.complete(Left(Channel.Closed), this)
+            true
+
+          override def onComplete(k: Listener[Res[Unit]]): Unit = poll(k)
+
+          override def dropListener(k: Listener[Res[Unit]]): Unit = ()
+
+      override def terminate(value: StreamResult.Terminated): Boolean =
+        synchronized:
+          if open then
+            open = false
+            handler(value.asInstanceOf[StreamResult[T]])
+            true
+          else false
+  end fromCallback
+
+  private def fromSendableChannel[T](
+      sendSrc: T => Async.Source[Res[Unit]],
+      onTerminate: StreamResult.Terminated => Unit
+  ): SendableStreamChannel[T] =
+    new SendableStreamChannel[T]:
+      private val closeLock: ReadWriteLock = new ReentrantReadWriteLock()
+      private var closed = false
+
+      override def sendSource(x: T): Async.Source[Res[Unit]] =
+        SourceUtil.addExternalLock(sendSrc(x), closeLock.readLock()) { (k, selfSrc) =>
+          if closed then
+            closeLock.readLock().unlock()
+            k.complete(Left(Channel.Closed), selfSrc)
+            false
+          else true
+        }
+
+      override def terminate(value: StreamResult.Terminated): Boolean =
+        closeLock.writeLock().lock()
+        val justTerminated = if closed then
+          closeLock.writeLock().unlock()
+          false
+        else
+          closed = true
+          closeLock.writeLock().unlock()
+          true
+
+        if justTerminated then onTerminate(value)
+        justTerminated
+  end fromSendableChannel
+
+  /** Create a [[SendableStreamChannel]] from a [[SendableChannel]] by forwarding all elements. Termination messages are
+    * not sent through the channel but must be handled externally.
+    *
+    * @param channel
+    *   the channel where to send the data elements
+    * @param onTerminate
+    *   the callback to invoke when the stream channel is closed
+    * @return
+    *   a new stream channel wrapper for the given channel
+    */
+  def fromChannel[T](channel: SendableChannel[T])(onTerminate: StreamResult.Terminated => Unit) =
+    fromSendableChannel(channel.sendSource, onTerminate)
+
+  /** Create a [[SendableStreamChannel]] from a [[SendableChannel]] by forwarding all data results. The termination
+    * message is sent exactly once when the stream channel is terminated.
+    *
+    * @param channel
+    *   the channel where to send the data
+    * @return
+    *   a new stream channel wrapper for the given channel
+    */
+  def fromResultChannel[T](channel: SendableChannel[StreamResult[T]]): SendableStreamChannel[T] =
+    fromSendableChannel(
+      { element => channel.sendSource(StreamResult.Data(element)) },
+      { termination =>
+        channel
+          .sendSource(termination.asInstanceOf[StreamResult[T]])
+          .onComplete(Listener.acceptingListener { (_, _) => })
+      }
+    )
+
+end SendableStreamChannel
 
 trait ReadableStreamChannel[+T]:
   /** An [[Async.Source]] corresponding to items being sent over the channel. Note that *each* listener attached to and
@@ -83,71 +207,19 @@ class GenericStreamChannel[T](private val channel: Channel[StreamResult[T]]) ext
   private val closeLock: ReadWriteLock = new ReentrantReadWriteLock()
 
   private def sendSource0(result: StreamResult[T]): Async.Source[Res[Unit]] =
-    val src = channel.sendSource(result)
-    new Async.Source[Res[Unit]]:
-      selfSrc =>
-      def transform(k: Listener[Res[Unit]]) =
-        new Listener.ForwardingListener[Res[Unit]](selfSrc, k):
-          // In both implementations (wrapping ListenerLock or top-level), acquire will succeed if either:
-          //  - finalResult is null, therefore terminate will wait for the writeLock until our release/complete, or
-          //  - we are sending the termination message right now (only done once if justTerminated in terminate).
-          // If we try to lock a non-termination-sender after termination, the lock attempt by src is rejected
-          //    and the downstream listener k is completed with a Left(Closed).
-          val lock =
-            if k.lock != null then
-              new Listener.ListenerLock {
-                override val selfNumber: Long = k.lock.selfNumber
-
-                override def acquire(): Boolean =
-                  if !k.lock.acquire() then false
-                  else
-                    closeLock.readLock().lock()
-                    if finalResult != null && result.isInstanceOf[StreamResult.Data[?]] then
-                      closeLock.readLock().unlock()
-                      k.complete(Left(Channel.Closed), selfSrc) // k.lock is already acquired
-                      false
-                    else true
-
-                override def release(): Unit =
-                  closeLock.readLock().unlock()
-                  k.lock.release()
-              }
-            else
-              new Listener.ListenerLock with Listener.NumberedLock {
-                override val selfNumber: Long = number
-
-                override def acquire(): Boolean =
-                  closeLock.readLock().lock()
-                  if finalResult != null && result.isInstanceOf[StreamResult.Data[?]] then
-                    closeLock.readLock().unlock()
-                    k.complete(Left(Channel.Closed), selfSrc) // k.lock is null
-                    false
-                  else
-                    acquireLock() // a wrapping Listener may expect on an exclusive lock
-                    true
-
-                override def release(): Unit =
-                  releaseLock()
-                  closeLock.readLock().unlock()
-              }
-          end lock
-
-          def complete(data: Res[Unit], source: Async.Source[Res[Unit]]) =
-            if k.lock == null then lock.release() // trigger our custom release process if k does not have a lock
-            else closeLock.readLock().unlock() //    otherwise only unlock the closeLock, as k.complete will do the rest
-            // this order implies that a send-attached Listener may learn about a successful send possibly after the send-end has been closed
-            k.complete(data, selfSrc)
-        end new
-      end transform
-
-      def poll(k: Listener[Res[Unit]]): Boolean =
-        src.poll(transform(k))
-      def onComplete(k: Listener[Res[Unit]]): Unit =
-        src.onComplete(transform(k))
-      def dropListener(k: Listener[Res[Unit]]): Unit =
-        val listener = Listener.ForwardingListener.empty[Res[Unit]](selfSrc, k)
-        src.dropListener(listener)
-  end sendSource0
+    // acquire will succeed if either:
+    //  - finalResult is null, therefore terminate will wait for the writeLock until our release/complete, or
+    //  - we are sending the termination message right now (only done once if justTerminated in terminate).
+    // If we try to lock a non-termination-sender after termination, the lock attempt by src is rejected
+    //    and the downstream listener k is completed with a Left(Closed).
+    SourceUtil.addExternalLock(channel.sendSource(result), closeLock.readLock()) { (k, selfSrc) =>
+      if finalResult != null && result.isInstanceOf[StreamResult.Data[?]] then
+        closeLock.readLock().unlock()
+        k.complete(Left(Channel.Closed), selfSrc) // k.lock is already acquired or not existent (checked in SourceUtil)
+        false
+      else true
+    }
+    // note: a send-attached Listener may learn about a successful send possibly after the send-end has been closed
 
   override def sendSource(x: T): Async.Source[Res[Unit]] = sendSource0(StreamResult.Data(x))
 
@@ -159,7 +231,7 @@ class GenericStreamChannel[T](private val channel: Channel[StreamResult[T]]) ext
         value
     }
 
-  override def terminate(value: StreamResult.Closed.type | StreamResult.Failed[?]): Boolean =
+  override def terminate(value: StreamResult.Terminated): Boolean =
     val theValue = value.asInstanceOf[StreamResult[T]] // [[Failed]] contains useless generic
 
     closeLock.writeLock().lock()
@@ -229,7 +301,7 @@ object BufferedStreamChannel:
       case Right(value) => StreamResult.Data(value)
     }
 
-    override def terminate(value: StreamResult.Closed.type | StreamResult.Failed[?]): Boolean = synchronized:
+    override def terminate(value: StreamResult.Terminated): Boolean = synchronized:
       if finalResult == null then
         finalResult = value.asInstanceOf[StreamResult[T]]
         cells.cancel()

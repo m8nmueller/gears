@@ -3,6 +3,10 @@ package gears.async.stream
 import gears.async.Async
 import gears.async.Future
 import scala.annotation.targetName
+import gears.async.SendableChannel
+import scala.util.Success
+import gears.async.Channel
+import scala.util.Try
 
 opaque type Stream[+Out] = SendableStreamChannel[Out] => List[Async ?=> Unit]
 
@@ -40,12 +44,68 @@ object Stream:
         flowTask :: srcTasks
       }
 
-    def run[T](handler: ReadableStreamChannel[Out] => Async ?=> T)(using fac: ChannelFactory)(using Async): T =
-      val ch = fac[Out]()
-      val tasks = src(ch)
+    /** Execute the handler in a scope where the stream is connected to the given channel and running. When the handler
+      * returns, the stream is cancelled.
+      *
+      * @param channel
+      *   the channel to connect the stream to
+      * @param handler
+      *   the handler to run when the stream is started
+      * @return
+      *   the result of the handler
+      */
+    def runWithChannel[T](channel: SendableStreamChannel[Out])(handler: Async ?=> T)(using Async): T =
+      val tasks = src(channel)
       Async.group:
         tasks.foreach(Future(_))
-        handler(ch)
+        handler
+
+    /** Execute the handler in a scope where the stream is connected to a new channel and running. The handler receives
+      * the reading end of the same channel. When it returns, the stream is cancelled.
+      *
+      * @param handler
+      *   the handler to run when the stream is started. Receives the read end of a newly created channel.
+      * @param fac
+      *   the factory used to create the channel
+      * @return
+      *   the result of the handler
+      */
+    def run[T](handler: ReadableStreamChannel[Out] => Async ?=> T)(using fac: ChannelFactory)(using Async): T =
+      val channel = fac[Out]()
+      runWithChannel(channel)(handler(channel))
+
+    /** Connect this stream to a channel, start it, and wait until the stream closes the write end channel.
+      *
+      * @param channel
+      *   the channel where this [[Stream]]'s items are emitted to
+      */
+    def startToStreamChannel(channel: SendableStreamChannel[Out])(using Async): Unit =
+      val done = Future.Promise[Unit]()
+
+      // a wrapper that delegates everything to the actual channel, but notices when the channel is completed
+      val wrappedChannel = new SendableStreamChannel[Out]:
+        override def sendSource(x: Out): Async.Source[Channel.Res[Unit]] = channel.sendSource(x)
+        override def terminate(value: StreamResult.Terminated): Boolean =
+          val res = channel.terminate(value)
+          if res then done.complete(Success(()))
+          res
+
+      runWithChannel(wrappedChannel)(done.awaitResult)
+
+    /** Connect this stream to a channel, start it, and wait until the stream closes the write end channel.
+      *
+      * @param channel
+      *   the channel where this [[Stream]]'s items are emitted to
+      * @return
+      *   the termination state sent by the stream, see [[Terminated.toTerminationTry]]
+      */
+    def startToChannel(channel: SendableChannel[Out])(using Async): Try[Unit] =
+      val done = Future.Promise[Unit]()
+
+      val wrappedChannel = SendableStreamChannel.fromChannel(channel): termination =>
+        done.complete(termination.toTerminationTry())
+
+      runWithChannel(wrappedChannel)(done.awaitResult)
 
   end extension // Stream
 

@@ -7,11 +7,10 @@ import gears.async.SendableChannel
 import scala.util.Success
 import gears.async.Channel
 import scala.util.Try
+import scala.util.Failure
 
 trait Stream[+Out]:
-  def through[NewOut](
-      flow: (ReadableStreamChannel[Out], SendableStreamChannel[NewOut]) => Async ?=> Unit
-  )(using fac: Stream.ChannelFactory): Stream[NewOut]
+  def through[NewOut](flow: Stream.Flow[Out, NewOut])(using Stream.ChannelFactory): Stream[NewOut]
 
   /** Execute the handler in a scope where the stream is connected to the given channel and running. When the handler
     * returns, the stream is cancelled.
@@ -26,6 +25,8 @@ trait Stream[+Out]:
   def runWithChannel[T](channel: SendableStreamChannel[Out])(handler: Async ?=> T)(using Async): T
 
 object Stream:
+
+  type Flow[In, Out] = (ReadableStreamChannel[In], SendableStreamChannel[Out]) => Async ?=> Unit
 
   private class StreamImpl[Out](val tasks: SendableStreamChannel[Out] => List[Async ?=> Unit]) extends Stream[Out]:
     override def through[NewOut](flow: (ReadableStreamChannel[Out], SendableStreamChannel[NewOut]) => Async ?=> Unit)(
@@ -105,6 +106,30 @@ object Stream:
         done.complete(termination.toTerminationTry())
 
       src.runWithChannel(wrappedChannel)(done.awaitResult)
+
+    /** Run this stream and collect its elements to a collection.
+      *
+      * For example, to collect to a [[List]]:
+      * {{{
+      * Stream(...).collect(List)
+      * }}}
+      *
+      * @param fac
+      *   the factory to create the collection instance
+      * @return
+      *   the collection once the stream finished successfully, a [[Failure]] if it fails at some point
+      */
+    def collect[C](fac: collection.Factory[Out, C])(using Async): Try[C] =
+      var builder = fac.newBuilder
+      val done = Future.Promise[C]()
+
+      val channel = SendableStreamChannel.fromCallback[Out] {
+        case StreamResult.Data(data)        => builder = builder.addOne(data)
+        case StreamResult.Closed            => done.complete(Success(builder.result()))
+        case StreamResult.Failed(exception) => done.complete(Failure(exception))
+      }
+
+      src.runWithChannel(channel)(done.awaitResult)
 
   end extension // Stream
 

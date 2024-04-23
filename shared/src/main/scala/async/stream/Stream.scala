@@ -8,57 +8,56 @@ import scala.util.Success
 import gears.async.Channel
 import scala.util.Try
 
-opaque type Stream[+Out] = SendableStreamChannel[Out] => List[Async ?=> Unit]
+trait Stream[+Out]:
+  def through[NewOut](
+      flow: (ReadableStreamChannel[Out], SendableStreamChannel[NewOut]) => Async ?=> Unit
+  )(using fac: Stream.ChannelFactory): Stream[NewOut]
 
-/** A (cold) stream is constructed in three stages:
-  *   - The [[Stream]] instance is created given a curried function of a channel (to write to) and an async capability
-  *   - The stream is attached to a channel (by applying the function) generating a set of async tasks
-  *   - The async tasks are started, each as a separate Future. Now, those tasks actually generate data and write to the
-  *     channels.
-  *
-  * This three-step process is embodied in the type of the [[apply]] function.
-  */
+  /** Execute the handler in a scope where the stream is connected to the given channel and running. When the handler
+    * returns, the stream is cancelled.
+    *
+    * @param channel
+    *   the channel to connect the stream to
+    * @param handler
+    *   the handler to run when the stream is started
+    * @return
+    *   the result of the handler
+    */
+  def runWithChannel[T](channel: SendableStreamChannel[Out])(handler: Async ?=> T)(using Async): T
+
 object Stream:
-  opaque type Flow[-In, +Out] = (ReadableStreamChannel[In], SendableStreamChannel[Out]) => List[Async ?=> Unit]
-  opaque type ChannelFactory = [T] => () => StreamChannel[T]
 
-  inline def apply[Out](inline fn: SendableStreamChannel[Out] => Async ?=> Unit): Stream[Out] = { ch => List(fn(ch)) }
-
-  extension [Out](src: Stream[Out])
-    @targetName("throughFlow")
-    def through[NewOut](flow: Flow[Out, NewOut])(using fac: ChannelFactory): Stream[NewOut] =
+  private class StreamImpl[Out](val tasks: SendableStreamChannel[Out] => List[Async ?=> Unit]) extends Stream[Out]:
+    override def through[NewOut](flow: (ReadableStreamChannel[Out], SendableStreamChannel[NewOut]) => Async ?=> Unit)(
+        using fac: ChannelFactory
+    ): Stream[NewOut] =
       val ch = fac[Out]()
-      val srcTasks = src(ch)
-      { send =>
-        val flowTasks = flow(ch, send)
-        flowTasks ::: srcTasks
-      }
-
-    def through[NewOut](
-        flow: (ReadableStreamChannel[Out], SendableStreamChannel[NewOut]) => Async ?=> Unit
-    )(using fac: ChannelFactory): Stream[NewOut] =
-      val ch = fac[Out]()
-      val srcTasks = src(ch)
-      { send =>
+      val srcTasks = this.tasks(ch)
+      StreamImpl: send =>
         val flowTask: Async ?=> Unit = flow(ch, send)
         flowTask :: srcTasks
-      }
 
-    /** Execute the handler in a scope where the stream is connected to the given channel and running. When the handler
-      * returns, the stream is cancelled.
-      *
-      * @param channel
-      *   the channel to connect the stream to
-      * @param handler
-      *   the handler to run when the stream is started
-      * @return
-      *   the result of the handler
-      */
-    def runWithChannel[T](channel: SendableStreamChannel[Out])(handler: Async ?=> T)(using Async): T =
-      val tasks = src(channel)
+    override def runWithChannel[T](channel: SendableStreamChannel[Out])(handler: Async ?=> T)(using Async): T =
+      val tasks = this.tasks(channel)
       Async.group:
         tasks.foreach(Future(_))
         handler
+  end StreamImpl
+
+  /** A (cold) stream is constructed in three stages:
+    *   - The [[Stream]] instance is created given a curried function of a channel (to write to) and an async capability
+    *   - The stream is attached to a channel (by applying the function) generating a set of async tasks
+    *   - The async tasks are started, each as a separate Future. Now, those tasks actually generate data and write to
+    *     the channels.
+    *
+    * @param fn
+    *   the initial task that will constitute the stream's computation. It is stored until the [[Stream]] is run.
+    * @return
+    *   a newly created unstarted stream
+    */
+  def apply[Out](fn: SendableStreamChannel[Out] => Async ?=> Unit): Stream[Out] = StreamImpl(ch => List(fn(ch)))
+
+  extension [Out](src: Stream[Out])
 
     /** Execute the handler in a scope where the stream is connected to a new channel and running. The handler receives
       * the reading end of the same channel. When it returns, the stream is cancelled.
@@ -72,7 +71,7 @@ object Stream:
       */
     def run[T](handler: ReadableStreamChannel[Out] => Async ?=> T)(using fac: ChannelFactory)(using Async): T =
       val channel = fac[Out]()
-      runWithChannel(channel)(handler(channel))
+      src.runWithChannel(channel)(handler(channel))
 
     /** Connect this stream to a channel, start it, and wait until the stream closes the write end channel.
       *
@@ -90,7 +89,7 @@ object Stream:
           if res then done.complete(Success(()))
           res
 
-      runWithChannel(wrappedChannel)(done.awaitResult)
+      src.runWithChannel(wrappedChannel)(done.awaitResult)
 
     /** Connect this stream to a channel, start it, and wait until the stream closes the write end channel.
       *
@@ -105,39 +104,12 @@ object Stream:
       val wrappedChannel = SendableStreamChannel.fromChannel(channel): termination =>
         done.complete(termination.toTerminationTry())
 
-      runWithChannel(wrappedChannel)(done.awaitResult)
+      src.runWithChannel(wrappedChannel)(done.awaitResult)
 
   end extension // Stream
 
+  opaque type ChannelFactory = [T] => () => StreamChannel[T]
   object ChannelFactory {
     given default: ChannelFactory = { [T] => () => BufferedStreamChannel[T](10) }
     inline def apply(inline fac: [T] => () => StreamChannel[T]): ChannelFactory = fac
   }
-
-  object Flow:
-    inline def apply[In, Out](
-        inline fn: (ReadableStreamChannel[In], SendableStreamChannel[Out]) => Async ?=> Unit
-    ): Flow[In, Out] = { (ch1, ch2) =>
-      List(fn(ch1, ch2))
-    }
-
-  extension [In, Out](flow0: Flow[In, Out])
-    @targetName("throughFlow")
-    def through[NewOut](flow: Flow[Out, NewOut])(using fac: ChannelFactory): Flow[In, NewOut] =
-      val ch = fac[Out]()
-      { (in, out) =>
-        val flow0Tasks = flow0(in, ch)
-        val flowTasks = flow(ch, out)
-        flowTasks ::: flow0Tasks
-      }
-
-    def through[NewOut](
-        flow: (ReadableStreamChannel[Out], SendableStreamChannel[NewOut]) => Async ?=> Unit
-    )(using fac: ChannelFactory): Flow[In, NewOut] =
-      val ch = fac[Out]()
-      { (in, out) =>
-        val flow0Tasks = flow0(in, ch)
-        val flowTasks: Async ?=> Unit = flow(ch, out)
-        flowTasks :: flow0Tasks
-      }
-  end extension // Flow

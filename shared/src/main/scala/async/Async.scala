@@ -171,9 +171,9 @@ object Async:
       * the value `T` if it is available.
       */
     def poll(): Option[T] =
-      var resultOpt: Option[T] = None
-      poll(Listener.acceptingListener { (x, _) => resultOpt = Some(x) })
-      resultOpt
+      val listener = PollListener[T]()
+      poll(listener)
+      listener.data
 
     /** Waits for an item to arrive from the source. Suspends until an item returns.
       *
@@ -181,6 +181,14 @@ object Async:
       */
     final def awaitResult(using ac: Async) = ac.await(this)
   end Source
+
+  private class PollListener[T] extends Listener[T]:
+    var data: Option[T] = None
+
+    override def complete(newData: T, source: Source[T]): Unit =
+      data = new Some(newData)
+
+    override val lock: Listener.ListenerLock | Null = null
 
   extension [T](src: Source[scala.util.Try[T]])
     /** Waits for an item to arrive from the source, then automatically unwraps it. Suspends until an item returns.

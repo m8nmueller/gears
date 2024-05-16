@@ -272,6 +272,9 @@ object BufferedStreamChannel:
     // Poll a reader, returning false if it should be put into queue
     def pollSend(src: CanSend, s: Sender): Boolean
 
+    def pollRead(): Option[StreamResult[T]]
+    def pollSend(src: CanSend): Option[SendResult]
+
     protected final def checkSendClosed(src: Async.Source[Res[Unit]], l: Sender): Boolean =
       if finalResult != null then
         l.completeNow(Left(Channel.Closed), src)
@@ -286,6 +289,7 @@ object BufferedStreamChannel:
 
     override val readStreamSource: Async.Source[ReadResult] = new Async.Source {
       override def poll(k: Reader): Boolean = pollRead(k)
+      override def poll(): Option[StreamResult[T]] = pollRead()
       override def onComplete(k: Reader): Unit = ImplBase.this.synchronized:
         if !pollRead(k) then cells.addReader(k)
       override def dropListener(k: Reader): Unit = ImplBase.this.synchronized:
@@ -310,6 +314,7 @@ object BufferedStreamChannel:
     // cancelling a send of a given item might in fact cancel that of an equal one.
     protected final class CanSend(val item: T) extends Async.Source[SendResult] {
       override def poll(k: Listener[SendResult]): Boolean = pollSend(this, k)
+      override def poll(): Option[SendResult] = pollSend(this)
       override def onComplete(k: Listener[SendResult]): Unit = ImplBase.this.synchronized:
         if !pollSend(this, k) then cells.addSender(this, k)
       override def dropListener(k: Listener[SendResult]): Unit = ImplBase.this.synchronized:
@@ -338,8 +343,9 @@ object BufferedStreamChannel:
         require(sender > 0)
         pending.head.asInstanceOf[(CanSend, Sender)]
       def dequeue() =
-        pending.dequeue()
+        val res = pending.dequeue()
         if reader > 0 then reader -= 1 else sender -= 1
+        res
       def addReader(r: Reader): this.type =
         require(sender == 0)
         reader += 1
@@ -421,6 +427,18 @@ object BufferedStreamChannel:
     override def pollSend(src: CanSend, s: Sender): Boolean = synchronized:
       checkSendClosed(src, s) || cells.matchSender(src, s) || senderToBuf(src, s)
 
+    override def pollSend(src: CanSend): Option[SendResult] = synchronized:
+      if finalResult != null then Some(Left(Channel.Closed))
+      else
+        val element = new StreamResult.Data(src.item)
+        while cells.hasReader do
+          // can remove reader b/c it's either gone or the operation will succeed
+          if cells.dequeue().asInstanceOf[Reader].completeNow(element, readStreamSource) then return Some(Right(()))
+        if buf.size < size then
+          buf += src.item
+          Some(Right(()))
+        else None
+
     // Check space in buf -> fail
     // If we can pop from buf -> try to feed a sender
     override def pollRead(r: Reader): Boolean = synchronized:
@@ -428,12 +446,22 @@ object BufferedStreamChannel:
         if r.completeNow(StreamResult.Data(buf.head), readStreamSource) then
           buf.dequeue()
           if cells.hasSender then
-            val (src, s) = cells.nextSender
-            cells.dequeue() // buf always has space available after dequeue
+            val (src, s) =
+              cells.dequeue().asInstanceOf[(CanSend, Sender)] // buf always has space available after dequeue
             senderToBuf(src, s)
           else if buf.isEmpty && finalResult != null then cells.cancelReader()
         true
       else checkReadClosed(r)
+
+    override def pollRead(): Option[StreamResult[T]] = synchronized:
+      buf.removeHeadOption() match
+        case Some(value) =>
+          if cells.hasSender then
+            val (src, s) =
+              cells.dequeue().asInstanceOf[(CanSend, Sender)] // buf always has space available after dequeue
+            senderToBuf(src, s)
+          Some(StreamResult.Data(value))
+        case None => Option(finalResult)
 
     // Try to add a sender to the buffer
     def senderToBuf(src: CanSend, s: Sender): Boolean =

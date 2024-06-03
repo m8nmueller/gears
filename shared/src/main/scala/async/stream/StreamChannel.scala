@@ -14,6 +14,7 @@ import scala.util.Success
 import scala.util.Failure
 import scala.collection.mutable
 import gears.async.listeners.lockBoth
+import gears.async.ChannelClosedException
 
 enum StreamResult[+T]:
   case Closed
@@ -273,7 +274,7 @@ object BufferedStreamChannel:
     def pollSend(src: CanSend, s: Sender): Boolean
 
     def pollRead(): Option[StreamResult[T]]
-    def pollSend(src: CanSend): Option[SendResult]
+    def pollSend(item: T): Option[SendResult]
 
     protected final def checkSendClosed(src: Async.Source[Res[Unit]], l: Sender): Boolean =
       if finalResult != null then
@@ -297,6 +298,12 @@ object BufferedStreamChannel:
     }
     override final def sendSource(x: T): Async.Source[SendResult] = CanSend(x)
 
+    override def send(x: T)(using ac: Async): Unit =
+      if pollSend(x).getOrElse(ac.await(sendSource(x))).isLeft then throw new ChannelClosedException()
+
+    override def readStream()(using ac: Async): StreamResult[T] =
+      pollRead().getOrElse(ac.await(readStreamSource))
+
     override def terminate(value: StreamResult.Terminated): Boolean = ImplBase.this.synchronized:
       if finalResult == null then
         finalResult = value.asInstanceOf[StreamResult[T]]
@@ -314,7 +321,7 @@ object BufferedStreamChannel:
     // cancelling a send of a given item might in fact cancel that of an equal one.
     protected final class CanSend(val item: T) extends Async.Source[SendResult] {
       override def poll(k: Listener[SendResult]): Boolean = pollSend(this, k)
-      override def poll(): Option[SendResult] = pollSend(this)
+      override def poll(): Option[SendResult] = pollSend(item)
       override def onComplete(k: Listener[SendResult]): Unit = ImplBase.this.synchronized:
         if !pollSend(this, k) then cells.addSender(this, k)
       override def dropListener(k: Listener[SendResult]): Unit = ImplBase.this.synchronized:
@@ -427,15 +434,15 @@ object BufferedStreamChannel:
     override def pollSend(src: CanSend, s: Sender): Boolean = synchronized:
       checkSendClosed(src, s) || cells.matchSender(src, s) || senderToBuf(src, s)
 
-    override def pollSend(src: CanSend): Option[SendResult] = synchronized:
+    override def pollSend(item: T): Option[SendResult] = synchronized:
       if finalResult != null then Some(Left(Channel.Closed))
       else
-        val element = new StreamResult.Data(src.item)
+        val element = new StreamResult.Data(item)
         while cells.hasReader do
           // can remove reader b/c it's either gone or the operation will succeed
           if cells.dequeue().asInstanceOf[Reader].completeNow(element, readStreamSource) then return Some(Right(()))
         if buf.size < size then
-          buf += src.item
+          buf += item
           Some(Right(()))
         else None
 

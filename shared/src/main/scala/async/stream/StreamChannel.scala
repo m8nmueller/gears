@@ -33,7 +33,7 @@ object StreamResult:
         case Closed            => Success(())
         case Failed(exception) => Failure(exception)
 
-trait SendableStreamChannel[-T] extends SendableChannel[T], java.io.Closeable:
+trait StreamSender[-T] extends java.io.Closeable:
   /** Terminate the channel with a given termination value. No more send operations (using [[sendSource]] or [[send]])
     * will be allowed afterwards. If the stream channel was terminated before, this does nothing. Especially, it does
     * not replace the termination value.
@@ -55,6 +55,13 @@ trait SendableStreamChannel[-T] extends SendableChannel[T], java.io.Closeable:
     *   the exception that will constitute the termination value
     */
   def fail(exception: Throwable): Unit = terminate(StreamResult.Failed(exception))
+
+  /** @see
+    *   [[SendableChannel.send]]
+    */
+  def send(x: T)(using Async): Unit
+
+trait SendableStreamChannel[-T] extends SendableChannel[T], StreamSender[T]
 
 object SendableStreamChannel:
   /** Create a send-only channel that will accept any element immediately and pass it to a given handler. It
@@ -161,7 +168,12 @@ object SendableStreamChannel:
 
 end SendableStreamChannel
 
-trait ReadableStreamChannel[+T]:
+trait StreamReader[+T]:
+  /** Read an item from the channel, suspending until the item has been received.
+    */
+  def readStream()(using Async): StreamResult[T]
+
+trait ReadableStreamChannel[+T] extends StreamReader[T]:
   /** An [[Async.Source]] corresponding to items being sent over the channel. Note that *each* listener attached to and
     * accepting a [[StreamResult.Data]] value corresponds to one value received over the channel.
     *
@@ -173,9 +185,7 @@ trait ReadableStreamChannel[+T]:
     */
   val readStreamSource: Async.Source[StreamResult[T]]
 
-  /** Read an item from the channel, suspending until the item has been received.
-    */
-  def readStream()(using Async): StreamResult[T] = readStreamSource.awaitResult
+  override def readStream()(using Async): StreamResult[T] = readStreamSource.awaitResult
 
 /** An variant of a channel that provides an error termination (to signal a failure condition by a sender to channel
   * readers). Furthermore, both successful (close) or failure termination are

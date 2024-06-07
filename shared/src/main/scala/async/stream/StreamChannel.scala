@@ -12,6 +12,7 @@ import gears.async.SourceUtil
 import scala.util.Try
 import scala.util.Success
 import scala.util.Failure
+import gears.async.ChannelSender
 
 enum StreamResult[+T]:
   case Closed
@@ -33,7 +34,7 @@ object StreamResult:
         case Closed            => Success(())
         case Failed(exception) => Failure(exception)
 
-trait StreamSender[-T] extends java.io.Closeable:
+trait StreamSender[-T] extends ChannelSender[T], java.io.Closeable:
   /** Terminate the channel with a given termination value. No more send operations (using [[sendSource]] or [[send]])
     * will be allowed afterwards. If the stream channel was terminated before, this does nothing. Especially, it does
     * not replace the termination value.

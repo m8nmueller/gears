@@ -10,9 +10,16 @@ import scala.util.{Failure, Success, Try}
 import Channel.{Closed, Res}
 import mutable.{ArrayBuffer, ListBuffer}
 
+trait ChannelSender[-T]:
+  /** Send `x` over the channel, suspending until the item has been sent or, if the channel is buffered, queued.
+    * @throws ChannelClosedException
+    *   if the channel was closed.
+    */
+  def send(x: T)(using Async): Unit
+
 /** The part of a channel one can send values to. Blocking behavior depends on the implementation.
   */
-trait SendableChannel[-T]:
+trait SendableChannel[-T] extends ChannelSender[T]:
   /** Create an [[Async.Source]] representing the send action of value `x`.
     *
     * Note that *each* listener attached to and accepting an [[Unit]] value corresponds to `x` being sent once.
@@ -30,18 +37,20 @@ trait SendableChannel[-T]:
     */
   def sendSource(x: T): Async.Source[Res[Unit]]
 
-  /** Send `x` over the channel, suspending until the item has been sent or, if the channel is buffered, queued.
-    * @throws ChannelClosedException
-    *   if the channel was closed.
-    */
   def send(x: T)(using Async): Unit = sendSource(x).awaitResult match
     case Right(_) => ()
     case Left(_)  => throw ChannelClosedException()
 end SendableChannel
 
+trait ChannelReader[+T]:
+  /** Read an item from the channel, suspending until the item has been received. Returns
+    * `Failure(ChannelClosedException)` if the channel was closed.
+    */
+  def read()(using Async): Res[T]
+
 /** The part of a channel one can read values from. Blocking behavior depends on the implementation.
   */
-trait ReadableChannel[+T]:
+trait ReadableChannel[+T] extends ChannelReader[T]:
   /** An [[Async.Source]] corresponding to items being sent over the channel. Note that *each* listener attached to and
     * accepting a [[Right]] value corresponds to one value received over the channel.
     *
@@ -53,9 +62,6 @@ trait ReadableChannel[+T]:
     */
   val readSource: Async.Source[Res[T]]
 
-  /** Read an item from the channel, suspending until the item has been received. Returns
-    * `Failure(ChannelClosedException)` if the channel was closed.
-    */
   def read()(using Async): Res[T] = readSource.awaitResult
 end ReadableChannel
 

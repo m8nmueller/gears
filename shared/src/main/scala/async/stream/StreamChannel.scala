@@ -160,19 +160,17 @@ end SendableStreamChannel
 /** A handle to pull elements from a [[StreamReader]]. It is created once using [[StreamReader.pull]] and can be used
   * repeatedly to request more elements.
   *
-  * When pulling, the producer blocks until a result (either exactly one element or the termination value) is available
-  * and feeds it to the handler passed to [[StreamReader.pull]]. The boolean result of the handler is forwarded as
-  * return value. It may be used to communicate from the handler to the caller of this [[StreamPull]] whether an element
-  * was actually consumed.
+  * When pulling, the producer blocks until a result is available and feeds it to the handler passed to
+  * [[StreamReader.pull]] until the item handler returns true or termination is reached.
   */
-type StreamPull = () => Async ?=> Boolean
+type StreamPull = () => Async ?=> Unit
 
 /** Trait to mixin to a partial [[StreamReader]] implementation providing [[StreamReader.pull]]
   */
 trait GenReadStream[+T] extends StreamReader[T]:
   override def readStream()(using Async): StreamResult[T] =
     var res: StreamResult[T] = null
-    pull(x => { res = Right(x); true }, x => { res = Left(x); true })()
+    pull(x => { res = Right(x); true }, x => res = Left(x))()
     res
 
 /** Trait to mixin to a partial [[StreamReader]] implementation providing [[StreamReader.readStream]]
@@ -180,11 +178,15 @@ trait GenReadStream[+T] extends StreamReader[T]:
 trait GenPull[+T] extends StreamReader[T]:
   override def pull(
       onItem: T => (Async) ?=> Boolean,
-      onTermination: StreamResult.Terminated => (Async) ?=> Boolean
+      onTermination: StreamResult.Terminated => (Async) ?=> Unit
   ): StreamPull = () =>
-    readStream() match
-      case Left(terminated) => onTermination(terminated)
-      case Right(item)      => onItem(item)
+    var continue = true
+    while continue do
+      readStream() match
+        case Left(terminated) =>
+          onTermination(terminated)
+          continue = false
+        case Right(item) => continue = !onItem(item)
 
 trait StreamReader[+T]:
   /** Read an item from the channel, suspending until the item has been received.
@@ -196,13 +198,13 @@ trait StreamReader[+T]:
     * per call).
     *
     * @param onItem
-    *   a handler to be called when an element is available
+    *   a handler to be called when an element is available. Return false to request another element.
     * @param onTermination
     *   a handler to be called when the producer is terminated
     * @return
     *   a [[StreamPull]] handle to request data
     */
-  def pull(onItem: T => Async ?=> Boolean, onTermination: StreamResult.Terminated => Async ?=> Boolean): StreamPull
+  def pull(onItem: T => Async ?=> Boolean, onTermination: StreamResult.Terminated => Async ?=> Unit): StreamPull
 
 trait ReadableStreamChannel[+T] extends StreamReader[T]:
   /** An [[Async.Source]] corresponding to items being sent over the channel. Note that *each* listener attached to and

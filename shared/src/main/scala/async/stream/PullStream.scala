@@ -39,7 +39,7 @@ private object PullLayers:
       override def readStream()(using Async): StreamResult[V] = upstream.readStream().map(mapper)
       override def pull(
           onItem: V => (Async) ?=> Boolean,
-          onTermination: StreamResult.Terminated => (Async) ?=> Boolean
+          onTermination: StreamResult.Terminated => (Async) ?=> Unit
       ): StreamPull = upstream.pull(onItem.compose(mapper), onTermination)
 
     trait ChannelLayer[T, V] extends ReadableStreamChannel[V]:

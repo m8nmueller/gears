@@ -2,6 +2,7 @@ package gears.async.stream
 
 import gears.async.Async
 import gears.async.Channel
+import gears.async.stream.StreamResult.StreamResult
 
 trait PullReaderStream[+T]:
   def toReader()(using Async): StreamReader[T]
@@ -35,17 +36,11 @@ private object PullLayers:
 
     trait ReaderLayer[T, V] extends StreamReader[V]:
       self: PullLayers.FromReader[T] with MapLayer[T, V] =>
-      override def readStream()(using Async): StreamResult[V] = upstream.readStream() match
-        case StreamResult.Data(data) => StreamResult.Data(mapper(data))
-        case other                   => other.asInstanceOf[StreamResult[V]]
+      override def readStream()(using Async): StreamResult[V] = upstream.readStream().map(mapper)
 
     trait ChannelLayer[T, V] extends ReadableStreamChannel[V]:
       self: PullLayers.FromChannel[T] with MapLayer[T, V] =>
-      val readStreamSource: Async.Source[StreamResult[V]] = upstream.readStreamSource.transformValuesWith {
-        _ match
-          case StreamResult.Data(data) => StreamResult.Data(mapper(data))
-          case other                   => other.asInstanceOf[StreamResult[V]]
-      }
+      val readStreamSource: Async.Source[StreamResult[V]] = upstream.readStreamSource.transformValuesWith(_.map(mapper))
 
     trait ReaderMixer[T, V] extends PullReaderStream[V]:
       self: PullLayers.FromReaderLayer[T] with MapLayer[T, V] =>

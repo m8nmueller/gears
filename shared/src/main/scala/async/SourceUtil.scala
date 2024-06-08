@@ -3,6 +3,31 @@ package gears.async
 import java.util.concurrent.locks.Lock
 
 private[async] object SourceUtil:
+  /** Create a Source from an upstream Source by transforming attached [[Listener]]s with
+    * [[Listener.ForwardingListener]]
+    *
+    * @param src
+    *   the upstream source to which to forward requests
+    */
+  trait DerivedSource[+T, V](val src: Async.Source[V]) extends Async.Source[T]:
+    /** Transform a Listener attached to [[poll]] and [[onComplete]]. It should extend
+      * `Listener.ForwardingListener(this, k)`
+      *
+      * @param k
+      *   the Listener attached to this Source
+      * @return
+      *   the Listener to attach to the upstream Source
+      */
+    def transform(k: Listener[T]): Listener[V]
+
+    override def poll(k: Listener[T]): Boolean =
+      src.poll(transform(k))
+    override def onComplete(k: Listener[T]): Unit =
+      src.onComplete(transform(k))
+    override def dropListener(k: Listener[T]): Unit =
+      val listener = Listener.ForwardingListener.empty[V](this, k)
+      src.dropListener(listener)
+
   /** Add a global locking layer to an [[Async.Source]] by transforming every attached listener.
     *
     * @param src
@@ -19,9 +44,9 @@ private[async] object SourceUtil:
   def addExternalLock[T](src: Async.Source[T], externalLock: Lock)(
       lockedCheck: (Listener[T], Async.Source[T]) => Boolean
   ): Async.Source[T] =
-    new Async.Source[T]:
+    new DerivedSource[T, T](src):
       selfSrc =>
-      def transform(k: Listener[T]) =
+      override def transform(k: Listener[T]) =
         new Listener.ForwardingListener[T](selfSrc, k):
           val lock =
             if k.lock != null then
@@ -60,11 +85,3 @@ private[async] object SourceUtil:
             k.complete(data, selfSrc)
         end new
       end transform
-
-      override def poll(k: Listener[T]): Boolean =
-        src.poll(transform(k))
-      override def onComplete(k: Listener[T]): Unit =
-        src.onComplete(transform(k))
-      override def dropListener(k: Listener[T]): Unit =
-        val listener = Listener.ForwardingListener.empty[T](selfSrc, k)
-        src.dropListener(listener)

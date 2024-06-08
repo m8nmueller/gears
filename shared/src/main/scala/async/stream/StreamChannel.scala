@@ -157,10 +157,52 @@ object SendableStreamChannel:
 
 end SendableStreamChannel
 
+/** A handle to pull elements from a [[StreamReader]]. It is created once using [[StreamReader.pull]] and can be used
+  * repeatedly to request more elements.
+  *
+  * When pulling, the producer blocks until a result (either exactly one element or the termination value) is available
+  * and feeds it to the handler passed to [[StreamReader.pull]]. The boolean result of the handler is forwarded as
+  * return value. It may be used to communicate from the handler to the caller of this [[StreamPull]] whether an element
+  * was actually consumed.
+  */
+type StreamPull = () => Async ?=> Boolean
+
+/** Trait to mixin to a partial [[StreamReader]] implementation providing [[StreamReader.pull]]
+  */
+trait GenReadStream[+T] extends StreamReader[T]:
+  override def readStream()(using Async): StreamResult[T] =
+    var res: StreamResult[T] = null
+    pull(x => { res = Right(x); true }, x => { res = Left(x); true })()
+    res
+
+/** Trait to mixin to a partial [[StreamReader]] implementation providing [[StreamReader.readStream]]
+  */
+trait GenPull[+T] extends StreamReader[T]:
+  override def pull(
+      onItem: T => (Async) ?=> Boolean,
+      onTermination: StreamResult.Terminated => (Async) ?=> Boolean
+  ): StreamPull = () =>
+    readStream() match
+      case Left(terminated) => onTermination(terminated)
+      case Right(item)      => onItem(item)
+
 trait StreamReader[+T]:
   /** Read an item from the channel, suspending until the item has been received.
     */
   def readStream()(using Async): StreamResult[T]
+
+  /** Create a persistent pull handle to extract data from this reader in an efficient manner. The handlers are never
+    * called asynchronously, but only as part of an invocation of the returned [[StreamPull]] (exactly one handle once
+    * per call).
+    *
+    * @param onItem
+    *   a handler to be called when an element is available
+    * @param onTermination
+    *   a handler to be called when the producer is terminated
+    * @return
+    *   a [[StreamPull]] handle to request data
+    */
+  def pull(onItem: T => Async ?=> Boolean, onTermination: StreamResult.Terminated => Async ?=> Boolean): StreamPull
 
 trait ReadableStreamChannel[+T] extends StreamReader[T]:
   /** An [[Async.Source]] corresponding to items being sent over the channel. Note that *each* listener attached to and
@@ -201,7 +243,7 @@ trait StreamChannel[T] extends SendableStreamChannel[T], ReadableStreamChannel[T
   * @param channel
   *   the channel that implements the actual communication. It should not be used directly.
   */
-class GenericStreamChannel[T](private val channel: Channel[StreamResult[T]]) extends StreamChannel[T]:
+class GenericStreamChannel[T](private val channel: Channel[StreamResult[T]]) extends StreamChannel[T] with GenPull[T]:
   private var finalResult: StreamResult[T] = null // access is synchronized with [[closeLock]]
   private val closeLock: ReadWriteLock = new ReentrantReadWriteLock()
 
@@ -259,7 +301,7 @@ object BufferedStreamChannel:
   // notable differences to BufferedChannel.Impl:
   //  - finalResults for check and to replace Left(Closed) on read --> new checkSendClosed method
   //  - in pollRead, close checking moved from 'before buffer checking' to 'after buffer checking'
-  private class Impl[T](size: Int) extends Channel.Impl[T] with StreamChannel[T]:
+  private class Impl[T](size: Int) extends Channel.Impl[T] with StreamChannel[T] with GenPull[T]:
     require(size > 0, "Buffered channels must have a buffer size greater than 0")
     val buf = new scala.collection.mutable.Queue[T](size)
     var finalResult: StreamResult[T] = null

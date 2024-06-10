@@ -4,10 +4,18 @@ import gears.async.Async
 import gears.async.Channel
 import gears.async.Listener
 
-trait PushSenderStream[+T] extends PushChannelStream[T]:
-  def runToSender(sender: StreamSender[T])(using Async): Unit
+/** A destination can either be a single Sender or a factory. If it is a factory, the producer should create a new
+  * instance for every parallel execution. A termination/intermediary step might decide it's sender logic is not
+  * thread-safe and thus pass a factory upstream. If it passes a single sender, it is considered thread-safe by the
+  * sender.
+  */
+type PushDestination[+S[-_], -T] = S[T] | Iterator[S[T]]
 
-  def runToChannel(channel: SendableStreamChannel[T])(using Async): Unit = runToSender(channel)
+trait PushSenderStream[+T] extends PushChannelStream[T]:
+  def runToSender(sender: PushDestination[StreamSender, T])(using Async): Unit
+
+  override def runToChannel(channel: PushDestination[SendableStreamChannel, T])(using Async): Unit =
+    runToSender(channel)
 
   override def map[V](mapper: T => V): PushSenderStream[V] =
     new PushLayers.MapLayer.SenderMixer[T, V]
@@ -20,7 +28,7 @@ trait PushSenderStream[+T] extends PushChannelStream[T]:
       with PushLayers.FromSenderLayer(this)
 
 trait PushChannelStream[+T]:
-  def runToChannel(channel: SendableStreamChannel[T])(using Async): Unit
+  def runToChannel(channel: PushDestination[SendableStreamChannel, T])(using Async): Unit
 
   def map[V](mapper: T => V): PushChannelStream[V] =
     new PushLayers.MapLayer.ChannelMixer[T, V]
@@ -38,36 +46,55 @@ private object PushLayers:
   type FromChannelLayer[V] = FromAnySenderLayer[PushChannelStream, V]
   type FromSenderLayer[V] = FromAnySenderLayer[PushSenderStream, V]
 
+  trait SenderMixer[-T, +V] extends PushSenderStream[V]:
+    self: FromSenderLayer[T] =>
+    def transform(sender: StreamSender[V]): StreamSender[T]
+
+    override def runToSender(sender: PushDestination[StreamSender, V])(using Async): Unit =
+      val transformed =
+        if sender.isInstanceOf[StreamSender[?]] then transform(sender.asInstanceOf[StreamSender[V]])
+        else sender.asInstanceOf[Iterator[StreamSender[V]]].map(transform)
+      upstream.runToSender(transformed)
+
+  trait ChannelMixer[-T, +V] extends PushChannelStream[V]:
+    self: FromChannelLayer[T] =>
+    def transform(channel: SendableStreamChannel[V]): SendableStreamChannel[T]
+
+    override def runToChannel(channel: PushDestination[SendableStreamChannel, V])(using Async): Unit =
+      val transformed =
+        if channel.isInstanceOf[SendableStreamChannel[?]] then transform(channel.asInstanceOf[SendableStreamChannel[V]])
+        else channel.asInstanceOf[Iterator[SendableStreamChannel[V]]].map(transform)
+      upstream.runToChannel(transformed)
+
   // helpers for the derived channels
   trait ToAnySender[+S[-_] <: StreamSender[_], -V](val downstream: S[V])
   type ToSender[V] = ToAnySender[StreamSender, V]
   type ToChannel[V] = ToAnySender[SendableStreamChannel, V]
 
   trait ForwardTerminate[T] extends StreamSender[T]:
-    self: PushLayers.ToSender[?] =>
-    def terminate(value: StreamResult.Terminated): Boolean = downstream.terminate(value)
+    self: ToAnySender[?, ?] =>
+    override def terminate(value: StreamResult.Terminated): Boolean = downstream.terminate(value)
 
   object MapLayer:
     trait MapLayer[T, V](val mapper: T => V)
 
-    trait SenderLayer[T, V] extends PushLayers.ForwardTerminate[T]:
-      self: PushLayers.ToSender[V] with MapLayer[T, V] =>
+    trait SenderLayer[T, V] extends ForwardTerminate[T]:
+      self: ToSender[V] with MapLayer[T, V] =>
       override def send(x: T)(using Async): Unit = downstream.send(mapper(x))
 
     trait ChannelLayer[T, V] extends SendableStreamChannel[T]:
-      self: PushLayers.ToChannel[V] with MapLayer[T, V] =>
-      def sendSource(x: T): Async.Source[Channel.Res[Unit]] = downstream.sendSource(mapper(x))
+      self: ToChannel[V] with MapLayer[T, V] =>
+      override def sendSource(x: T): Async.Source[Channel.Res[Unit]] = downstream.sendSource(mapper(x))
 
-    trait SenderMixer[T, V] extends PushSenderStream[V]:
-      self: PushLayers.FromSenderLayer[T] with MapLayer[T, V] =>
-      def runToSender(sender: StreamSender[V])(using Async): Unit =
-        upstream.runToSender(new SenderLayer[T, V] with PushLayers.ToSender(sender) with MapLayer(mapper))
+    trait SenderMixer[T, V] extends PushLayers.SenderMixer[T, V]:
+      self: FromSenderLayer[T] with MapLayer[T, V] =>
+      override def transform(sender: StreamSender[V]): StreamSender[T] =
+        new SenderLayer[T, V] with ToSender(sender) with MapLayer(mapper)
 
-    trait ChannelMixer[T, V] extends PushChannelStream[V]:
-      self: PushLayers.FromChannelLayer[T] with MapLayer[T, V] =>
-      def runToChannel(channel: SendableStreamChannel[V])(using Async): Unit = upstream.runToChannel(
-        new ChannelLayer[T, V] with SenderLayer[T, V] with PushLayers.ToChannel[V](channel) with MapLayer[T, V](mapper)
-      )
+    trait ChannelMixer[T, V] extends PushLayers.ChannelMixer[T, V]:
+      self: FromChannelLayer[T] with MapLayer[T, V] =>
+      override def transform(channel: SendableStreamChannel[V]): SendableStreamChannel[T] =
+        new ChannelLayer[T, V] with SenderLayer[T, V] with ToChannel[V](channel) with MapLayer[T, V](mapper)
   end MapLayer
 
   object FilterLayer:
@@ -86,25 +113,24 @@ private object PushLayers:
 
     trait FilterLayer[T](val filter: T => Boolean)
 
-    trait SenderLayer[T] extends PushLayers.ForwardTerminate[T]:
-      self: PushLayers.ToSender[T] with FilterLayer[T] =>
+    trait SenderLayer[T] extends ForwardTerminate[T]:
+      self: ToSender[T] with FilterLayer[T] =>
       override def send(x: T)(using Async): Unit = if filter(x) then downstream.send(x)
 
     trait ChannelLayer[T] extends SendableStreamChannel[T]:
-      self: PushLayers.ToChannel[T] with FilterLayer[T] =>
-      def sendSource(x: T): Async.Source[Channel.Res[Unit]] =
+      self: ToChannel[T] with FilterLayer[T] =>
+      override def sendSource(x: T): Async.Source[Channel.Res[Unit]] =
         if filter(x) then downstream.sendSource(x)
         else NoopSource
 
-    trait SenderMixer[T] extends PushSenderStream[T]:
-      self: PushLayers.FromSenderLayer[T] with FilterLayer[T] =>
-      def runToSender(sender: StreamSender[T])(using Async): Unit =
-        upstream.runToSender(new SenderLayer[T] with FilterLayer(filter) with PushLayers.ToSender(sender))
+    trait SenderMixer[T] extends PushLayers.SenderMixer[T, T]:
+      self: FromSenderLayer[T] with FilterLayer[T] =>
+      override def transform(sender: StreamSender[T]): StreamSender[T] =
+        new SenderLayer[T] with FilterLayer(filter) with ToSender(sender)
 
-    trait ChannelMixer[T] extends PushChannelStream[T]:
-      self: PushLayers.FromChannelLayer[T] with FilterLayer[T] =>
-      def runToChannel(channel: SendableStreamChannel[T])(using Async): Unit = upstream.runToChannel(
-        new ChannelLayer[T] with SenderLayer[T] with FilterLayer(filter) with PushLayers.ToChannel(channel)
-      )
+    trait ChannelMixer[T] extends PushLayers.ChannelMixer[T, T]:
+      self: FromChannelLayer[T] with FilterLayer[T] =>
+      override def transform(channel: SendableStreamChannel[T]): SendableStreamChannel[T] =
+        new ChannelLayer[T] with SenderLayer[T] with FilterLayer(filter) with ToChannel(channel)
   end FilterLayer
 end PushLayers

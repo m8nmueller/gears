@@ -8,8 +8,15 @@ import gears.async.Listener
 import gears.async.Listener.ListenerLock
 import gears.async.SourceUtil
 
+/** A source should provide means for parallel execution. As the execution is driven by the consumer, the consumer tells
+  * the producer the degree of parallelism (via the int parameter) and the producer decides whether its readers are
+  * thread-safe. If they are, it may return a single reader. Otherwise, it returns a factory for sources that will only
+  * be employed on one thread.
+  */
+type PullSource[+S[+_], +T] = Int => S[T] | Iterator[S[T]]
+
 trait PullReaderStream[+T]:
-  def toReader()(using Async): StreamReader[T]
+  def toReader()(using Async): PullSource[StreamReader, T]
 
   def map[V](mapper: T => V): PullReaderStream[V] =
     new PullLayers.MapLayer.ReaderMixer[T, V]
@@ -22,8 +29,8 @@ trait PullReaderStream[+T]:
       with PullLayers.FromReaderLayer(this)
 
 trait PullChannelStream[+T] extends PullReaderStream[T]:
-  def toChannel()(using Async): ReadableStreamChannel[T]
-  override def toReader()(using Async): StreamReader[T] = toChannel()
+  def toChannel()(using Async): PullSource[ReadableStreamChannel, T]
+  override def toReader()(using Async): PullSource[StreamReader, T] = toChannel()
 
   override def map[V](mapper: T => V): PullChannelStream[V] =
     new PullLayers.MapLayer.ChannelMixer[T, V]
@@ -46,11 +53,32 @@ private object PullLayers:
   type FromReader[V] = FromAnyReader[StreamReader, V]
   type FromChannel[V] = FromAnyReader[ReadableStreamChannel, V]
 
+  trait ReaderMixer[T, V] extends PullReaderStream[V]:
+    self: FromReaderLayer[T] =>
+    def transform(reader: StreamReader[T]): StreamReader[V]
+    override def toReader()(using Async): PullSource[StreamReader, V] =
+      upstream
+        .toReader()
+        .andThen: inReader =>
+          if inReader.isInstanceOf[StreamReader[?]] then transform(inReader.asInstanceOf[StreamReader[T]])
+          else inReader.asInstanceOf[Iterator[StreamReader[T]]].map(transform)
+
+  trait ChannelMixer[T, V] extends PullChannelStream[V]:
+    self: FromChannelLayer[T] =>
+    def transform(channel: ReadableStreamChannel[T]): ReadableStreamChannel[V]
+    override def toChannel()(using Async): PullSource[ReadableStreamChannel, V] =
+      upstream
+        .toChannel()
+        .andThen: inChannel =>
+          if inChannel.isInstanceOf[ReadableStreamChannel[?]] then
+            transform(inChannel.asInstanceOf[ReadableStreamChannel[T]])
+          else inChannel.asInstanceOf[Iterator[ReadableStreamChannel[T]]].map(transform)
+
   object MapLayer:
     trait MapLayer[T, V](val mapper: T => V)
 
     trait ReaderLayer[T, V] extends StreamReader[V]:
-      self: PullLayers.FromReader[T] with MapLayer[T, V] =>
+      self: FromReader[T] with MapLayer[T, V] =>
       override def readStream()(using Async): StreamResult[V] = upstream.readStream().map(mapper)
       override def pull(
           onItem: V => (Async) ?=> Boolean,
@@ -58,27 +86,26 @@ private object PullLayers:
       ): StreamPull = upstream.pull(onItem.compose(mapper), onTermination)
 
     trait ChannelLayer[T, V] extends ReadableStreamChannel[V]:
-      self: PullLayers.FromChannel[T] with MapLayer[T, V] =>
-      val readStreamSource: Async.Source[StreamResult[V]] = upstream.readStreamSource.transformValuesWith(_.map(mapper))
+      self: FromChannel[T] with MapLayer[T, V] =>
+      override val readStreamSource: Async.Source[StreamResult[V]] =
+        upstream.readStreamSource.transformValuesWith(_.map(mapper))
 
-    trait ReaderMixer[T, V] extends PullReaderStream[V]:
-      self: PullLayers.FromReaderLayer[T] with MapLayer[T, V] =>
-      def toReader()(using Async): StreamReader[V] =
-        new ReaderLayer[T, V] with PullLayers.FromReader(upstream.toReader()) with MapLayer(mapper)
+    trait ReaderMixer[T, V] extends PullLayers.ReaderMixer[T, V]:
+      self: FromReaderLayer[T] with MapLayer[T, V] =>
+      override def transform(reader: StreamReader[T]): StreamReader[V] =
+        new ReaderLayer[T, V] with FromReader(reader) with MapLayer(mapper)
 
-    trait ChannelMixer[T, V] extends PullChannelStream[V]:
-      self: PullLayers.FromChannelLayer[T] with MapLayer[T, V] =>
-      def toChannel()(using Async): ReadableStreamChannel[V] = new ChannelLayer[T, V]
-        with ReaderLayer[T, V]
-        with PullLayers.FromChannel[T](upstream.toChannel())
-        with MapLayer[T, V](mapper)
+    trait ChannelMixer[T, V] extends PullLayers.ChannelMixer[T, V]:
+      self: FromChannelLayer[T] with MapLayer[T, V] =>
+      override def transform(channel: ReadableStreamChannel[T]): ReadableStreamChannel[V] =
+        new ChannelLayer[T, V] with ReaderLayer[T, V] with FromChannel[T](channel) with MapLayer[T, V](mapper)
   end MapLayer
 
   object FilterLayer:
     trait FilterLayer[T](val filter: T => Boolean)
 
     trait ReaderLayer[T] extends StreamReader[T]:
-      self: PullLayers.FromReader[T] with FilterLayer[T] =>
+      self: FromReader[T] with FilterLayer[T] =>
       override def readStream()(using Async): StreamResult[T] =
         var data = upstream.readStream()
         // only continue if is right (item) and that item does not match the filter
@@ -90,7 +117,7 @@ private object PullLayers:
       ): StreamPull = upstream.pull(item => filter(item) && onItem(item), onTermination)
 
     trait ChannelLayer[T] extends ReadableStreamChannel[T]:
-      self: PullLayers.FromChannel[T] with FilterLayer[T] =>
+      self: FromChannel[T] with FilterLayer[T] =>
       override val readStreamSource: Async.Source[StreamResult[T]] =
         new SourceUtil.DerivedSource[StreamResult[T], StreamResult[T]](upstream.readStreamSource):
           selfSrc =>
@@ -124,16 +151,14 @@ private object PullLayers:
             res
     end ChannelLayer
 
-    trait ReaderMixer[T] extends PullReaderStream[T]:
-      self: PullLayers.FromReaderLayer[T] with FilterLayer[T] =>
-      def toReader()(using Async): StreamReader[T] =
-        new ReaderLayer[T] with PullLayers.FromReader(upstream.toReader()) with FilterLayer(filter)
+    trait ReaderMixer[T] extends PullLayers.ReaderMixer[T, T]:
+      self: FromReaderLayer[T] with FilterLayer[T] =>
+      override def transform(reader: StreamReader[T]): StreamReader[T] =
+        new ReaderLayer[T] with FromReader(reader) with FilterLayer(filter)
 
-    trait ChannelMixer[T] extends PullChannelStream[T]:
-      self: PullLayers.FromChannelLayer[T] with FilterLayer[T] =>
-      def toChannel()(using Async): ReadableStreamChannel[T] = new ChannelLayer[T]
-        with ReaderLayer[T]
-        with PullLayers.FromChannel[T](upstream.toChannel())
-        with FilterLayer[T](filter)
+    trait ChannelMixer[T] extends PullLayers.ChannelMixer[T, T]:
+      self: FromChannelLayer[T] with FilterLayer[T] =>
+      override def transform(channel: ReadableStreamChannel[T]): ReadableStreamChannel[T] =
+        new ChannelLayer[T] with ReaderLayer[T] with PullLayers.FromChannel[T](channel) with FilterLayer[T](filter)
   end FilterLayer
 end PullLayers

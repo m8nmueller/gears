@@ -14,6 +14,7 @@ import scala.util.Success
 import scala.util.Failure
 import gears.async.ChannelSender
 import StreamResult.StreamResult
+import scala.util.boundary
 
 object StreamResult:
   object Closed
@@ -162,8 +163,10 @@ end SendableStreamChannel
   *
   * When pulling, the producer blocks until a result is available and feeds it to the handler passed to
   * [[StreamReader.pull]] until the item handler returns true or termination is reached.
+  *
+  * The pull returns true until termination of the source is reached.
   */
-type StreamPull = () => Async ?=> Unit
+type StreamPull = () => Async ?=> Boolean
 
 /** Trait to mixin to a partial [[StreamReader]] implementation providing [[StreamReader.pull]]
   */
@@ -180,13 +183,14 @@ trait GenPull[+T] extends StreamReader[T]:
       onItem: T => (Async) ?=> Boolean,
       onTermination: StreamResult.Terminated => (Async) ?=> Unit
   ): StreamPull = () =>
-    var continue = true
-    while continue do
-      readStream() match
-        case Left(terminated) =>
-          onTermination(terminated)
-          continue = false
-        case Right(item) => continue = !onItem(item)
+    boundary:
+      while true do
+        readStream() match
+          case Left(terminated) =>
+            onTermination(terminated)
+            boundary.break(false)
+          case Right(item) => if !onItem(item) then boundary.break(true)
+      false
 
 trait StreamReader[+T]:
   /** Read an item from the channel, suspending until the item has been received.

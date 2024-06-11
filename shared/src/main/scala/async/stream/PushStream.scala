@@ -3,6 +3,7 @@ package gears.async.stream
 import gears.async.Async
 import gears.async.Channel
 import gears.async.Listener
+import gears.async.Future
 
 /** A destination can either be a single Sender or a factory. If it is a factory, the producer should create a new
   * instance for every parallel execution. A termination/intermediary step might decide it's sender logic is not
@@ -40,6 +41,16 @@ trait PushChannelStream[+T]:
       with PushLayers.FilterLayer.FilterLayer(test)
       with PushLayers.FromChannelLayer(this)
 
+  def pulledThrough(bufferSize: Int): PullChannelStream[T] = new PullChannelStream[T]:
+    override def runWithChannel[A](parallelism: Int)(body: PullSource[ReadableStreamChannel, T] => Async ?=> A)(using
+        Async
+    ): A =
+      // the channel is thread-safe -> the consumer may use it from multiple threads
+      val channel = BufferedStreamChannel[T](bufferSize)
+      Async.group:
+        Future { runToChannel(channel) }
+        body(channel)
+
 private object PushLayers:
   // helpers for generating the layer ("mixer") traits (for derived streams)
   trait FromAnySenderLayer[+S[+_] <: PushChannelStream[_], +V](val upstream: S[V])
@@ -51,20 +62,14 @@ private object PushLayers:
     def transform(sender: StreamSender[V]): StreamSender[T]
 
     override def runToSender(sender: PushDestination[StreamSender, V])(using Async): Unit =
-      val transformed =
-        if sender.isInstanceOf[StreamSender[?]] then transform(sender.asInstanceOf[StreamSender[V]])
-        else sender.asInstanceOf[Iterator[StreamSender[V]]].map(transform)
-      upstream.runToSender(transformed)
+      upstream.runToSender(mapMaybeIt(sender)(transform))
 
   trait ChannelMixer[-T, +V] extends PushChannelStream[V]:
     self: FromChannelLayer[T] =>
     def transform(channel: SendableStreamChannel[V]): SendableStreamChannel[T]
 
     override def runToChannel(channel: PushDestination[SendableStreamChannel, V])(using Async): Unit =
-      val transformed =
-        if channel.isInstanceOf[SendableStreamChannel[?]] then transform(channel.asInstanceOf[SendableStreamChannel[V]])
-        else channel.asInstanceOf[Iterator[SendableStreamChannel[V]]].map(transform)
-      upstream.runToChannel(transformed)
+      upstream.runToChannel(mapMaybeIt(channel)(transform))
 
   // helpers for the derived channels
   trait ToAnySender[+S[-_] <: StreamSender[_], -V](val downstream: S[V])

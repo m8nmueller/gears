@@ -9,14 +9,24 @@ import gears.async.Listener.ListenerLock
 import gears.async.SourceUtil
 
 /** A source should provide means for parallel execution. As the execution is driven by the consumer, the consumer tells
-  * the producer the degree of parallelism (via the int parameter) and the producer decides whether its readers are
-  * thread-safe. If they are, it may return a single reader. Otherwise, it returns a factory for sources that will only
-  * be employed on one thread.
+  * the producer the degree of parallelism (see [[PullReaderStream.runWithReader]]) and the producer decides whether its
+  * readers are thread-safe. If they are, it may pass a single reader. Otherwise, it passes a factory for sources that
+  * will only be employed on one thread.
   */
-type PullSource[+S[+_], +T] = Int => S[T] | Iterator[S[T]]
+type PullSource[+S[+_], +T] = S[T] | Iterator[S[T]]
 
 trait PullReaderStream[+T]:
-  def toReader()(using Async): PullSource[StreamReader, T]
+  /** Run the reader stream by creating one/multiple readers and passing it to the receiving body. Computation is
+    * terminated once the body returns.
+    *
+    * @param parallelism
+    *   the number of reader instances that the receiver requests for concurrent access
+    * @param body
+    *   the receiver body that runs on the readers
+    * @return
+    *   the result of the body
+    */
+  def runWithReader[A](parallelism: Int)(body: PullSource[StreamReader, T] => Async ?=> A)(using Async): A
 
   def map[V](mapper: T => V): PullReaderStream[V] =
     new PullLayers.MapLayer.ReaderMixer[T, V]
@@ -29,8 +39,12 @@ trait PullReaderStream[+T]:
       with PullLayers.FromReaderLayer(this)
 
 trait PullChannelStream[+T] extends PullReaderStream[T]:
-  def toChannel()(using Async): PullSource[ReadableStreamChannel, T]
-  override def toReader()(using Async): PullSource[StreamReader, T] = toChannel()
+  /** @see
+    *   PullReaderStream.runWithReader
+    */
+  def runWithChannel[A](parallelism: Int)(body: PullSource[ReadableStreamChannel, T] => Async ?=> A)(using Async): A
+  override def runWithReader[A](parallelism: Int)(body: PullSource[StreamReader, T] => Async ?=> A)(using Async): A =
+    runWithChannel(parallelism)(body)
 
   override def map[V](mapper: T => V): PullChannelStream[V] =
     new PullLayers.MapLayer.ChannelMixer[T, V]
@@ -56,23 +70,25 @@ private object PullLayers:
   trait ReaderMixer[T, V] extends PullReaderStream[V]:
     self: FromReaderLayer[T] =>
     def transform(reader: StreamReader[T]): StreamReader[V]
-    override def toReader()(using Async): PullSource[StreamReader, V] =
-      upstream
-        .toReader()
-        .andThen: inReader =>
+    override def runWithReader[A](parallelism: Int)(body: PullSource[StreamReader, V] => Async ?=> A)(using Async): A =
+      upstream.runWithReader(parallelism): inReader =>
+        val reader =
           if inReader.isInstanceOf[StreamReader[?]] then transform(inReader.asInstanceOf[StreamReader[T]])
           else inReader.asInstanceOf[Iterator[StreamReader[T]]].map(transform)
+        body(reader)
 
   trait ChannelMixer[T, V] extends PullChannelStream[V]:
     self: FromChannelLayer[T] =>
     def transform(channel: ReadableStreamChannel[T]): ReadableStreamChannel[V]
-    override def toChannel()(using Async): PullSource[ReadableStreamChannel, V] =
-      upstream
-        .toChannel()
-        .andThen: inChannel =>
+    override def runWithChannel[A](parallelism: Int)(body: PullSource[ReadableStreamChannel, V] => Async ?=> A)(using
+        Async
+    ): A =
+      upstream.runWithChannel(parallelism): inChannel =>
+        val channel =
           if inChannel.isInstanceOf[ReadableStreamChannel[?]] then
             transform(inChannel.asInstanceOf[ReadableStreamChannel[T]])
           else inChannel.asInstanceOf[Iterator[ReadableStreamChannel[T]]].map(transform)
+        body(channel)
 
   object MapLayer:
     trait MapLayer[T, V](val mapper: T => V)

@@ -4,6 +4,7 @@ import gears.async.Async
 import gears.async.Channel
 import gears.async.Listener
 import gears.async.Future
+import gears.async.Cancellable
 
 /** A destination can either be a single Sender or a factory. If it is a factory, the producer should create a new
   * instance for every parallel execution. A termination/intermediary step might decide it's sender logic is not
@@ -41,14 +42,28 @@ trait PushChannelStream[+T]:
       with PushLayers.FilterLayer.FilterLayer(test)
       with PushLayers.FromChannelLayer(this)
 
+  /** Transform this push stream into a pull stream by creating an intermediary stream channel where all elements flow
+    * through. This stream will be started asynchronously to run the pulling body synchronously.
+    *
+    * @param bufferSize
+    *   the size of the buffer of the channel
+    * @return
+    *   a new pull stream where the elements that this push stream produces can be read from
+    * @see
+    *   BufferedStreamChannel
+    */
   def pulledThrough(bufferSize: Int): PullChannelStream[T] = new PullChannelStream[T]:
     override def runWithChannel[A](parallelism: Int)(body: PullSource[ReadableStreamChannel, T] => Async ?=> A)(using
         Async
     ): A =
       // the channel is thread-safe -> the consumer may use it from multiple threads
       val channel = BufferedStreamChannel[T](bufferSize)
+
       Async.group:
-        Future { runToChannel(channel) }
+        // speeds up stream cancellation when body returns because channels do not check for cancellation unless full
+        Cancellable.fromCloseable(channel).link()
+
+        Future { runToChannel(channel) } // ignore result/exception as this is handled by stream termination
         body(channel)
 
 private object PushLayers:
@@ -78,7 +93,7 @@ private object PushLayers:
 
   trait ForwardTerminate[T] extends StreamSender[T]:
     self: ToAnySender[?, ?] =>
-    override def terminate(value: StreamResult.Terminated): Boolean = downstream.terminate(value)
+    override def terminate(value: StreamResult.Done): Boolean = downstream.terminate(value)
 
   object MapLayer:
     trait MapLayer[T, V](val mapper: T => V)

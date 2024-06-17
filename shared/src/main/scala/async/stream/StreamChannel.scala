@@ -16,12 +16,32 @@ import gears.async.ChannelSender
 import StreamResult.StreamResult
 import scala.util.boundary
 
+/** This object groups the types and exceptions used used to communicate stream termination from upstream to downstream
+  * and vice-versa. Towards downstream, termination is ordered as argument or indicated as return value ([[Done]]).
+  * Towards upstream, termination is indicated as exception and ordered through cancellation means.
+  */
 object StreamResult:
-  object Closed
-  type Closed = Closed.type
+  /** This result indicates that a single sender is closed, but in case of parallel instances, processing may go on. The
+    * corresponding exception is the [[ChannelClosedException]].
+    */
+  val Closed = Channel.Closed
+  type Closed = Channel.Closed
 
-  type Terminated = Closed | Throwable
-  type StreamResult[+T] = Either[Terminated, T]
+  /** This result indicates that the entire stream is done successfully. The corresponding exception is the
+    * [[StreamTerminatedException]].
+    */
+  object Terminated
+  type Terminated = Terminated.type
+
+  /** The exception used to communicate stream termination (both [[Terminated]] and failure)
+    * @see
+    *   Terminated
+    */
+  class StreamTerminatedException(cause: Throwable) extends Exception(cause):
+    def this() = this(null)
+
+  type Done = Closed | Terminated | Throwable
+  type StreamResult[+T] = Either[Done, T]
 
 trait StreamSender[-T] extends ChannelSender[T], java.io.Closeable:
   /** Terminate the channel with a given termination value. No more send operations (using [[sendSource]] or [[send]])
@@ -29,11 +49,12 @@ trait StreamSender[-T] extends ChannelSender[T], java.io.Closeable:
     * not replace the termination value.
     *
     * @param value
-    *   [[StreamResult.Closed]] to signal completion, or [[StreamResult.Failed]] to signal a failure
+    *   [[StreamResult.Closed]]/[[StreamResult.Terminated]] to signal completion, or [[StreamResult.Failed]] to signal a
+    *   failure
     * @return
     *   true iff this channel was terminated by that call with the given value
     */
-  def terminate(value: StreamResult.Terminated): Boolean
+  def terminate(value: StreamResult.Done): Boolean
 
   /** Close the channel now. Does nothing if the channel is already terminated.
     */
@@ -85,7 +106,7 @@ object SendableStreamChannel:
 
           override def dropListener(k: Listener[Res[Unit]]): Unit = ()
 
-      override def terminate(value: StreamResult.Terminated): Boolean =
+      override def terminate(value: StreamResult.Done): Boolean =
         synchronized:
           if open then
             open = false
@@ -96,7 +117,7 @@ object SendableStreamChannel:
 
   private def fromSendableChannel[T](
       sendSrc: T => Async.Source[Res[Unit]],
-      onTerminate: StreamResult.Terminated => Unit
+      onTerminate: StreamResult.Done => Unit
   ): SendableStreamChannel[T] =
     new SendableStreamChannel[T]:
       private val closeLock: ReadWriteLock = new ReentrantReadWriteLock()
@@ -111,7 +132,7 @@ object SendableStreamChannel:
           else true
         }
 
-      override def terminate(value: StreamResult.Terminated): Boolean =
+      override def terminate(value: StreamResult.Done): Boolean =
         closeLock.writeLock().lock()
         val justTerminated = if closed then
           closeLock.writeLock().unlock()
@@ -135,7 +156,7 @@ object SendableStreamChannel:
     * @return
     *   a new stream channel wrapper for the given channel
     */
-  def fromChannel[T](channel: SendableChannel[T])(onTerminate: StreamResult.Terminated => Unit) =
+  def fromChannel[T](channel: SendableChannel[T])(onTerminate: StreamResult.Done => Unit) =
     fromSendableChannel(channel.sendSource, onTerminate)
 
   /** Create a [[SendableStreamChannel]] from a [[SendableChannel]] by forwarding all data results. The termination
@@ -164,51 +185,47 @@ end SendableStreamChannel
   * When pulling, the producer blocks until a result is available and feeds it to the handler passed to
   * [[StreamReader.pull]] until the item handler returns true or termination is reached.
   *
-  * The pull returns true until termination of the source is reached.
+  * The pull returns [[None]] until termination of the source is reached. When the source returns a termination value,
+  * this may happen after zero or more onItem attempts (one successful at the most, as usual).
   */
-type StreamPull = () => Async ?=> Boolean
+type StreamPull = () => Async ?=> Option[StreamResult.Done]
 
 /** Trait to mixin to a partial [[StreamReader]] implementation providing [[StreamReader.pull]]
   */
 trait GenReadStream[+T] extends StreamReader[T]:
   override def readStream()(using Async): StreamResult[T] =
     var res: StreamResult[T] = null
-    pull(x => { res = Right(x); true }, x => res = Left(x))()
-    res
+    pull(x => { res = Right(x); true })() match
+      case None              => res
+      case Some(termination) => Left(termination)
 
 /** Trait to mixin to a partial [[StreamReader]] implementation providing [[StreamReader.readStream]]
   */
 trait GenPull[+T] extends StreamReader[T]:
-  override def pull(
-      onItem: T => (Async) ?=> Boolean,
-      onTermination: StreamResult.Terminated => (Async) ?=> Unit
-  ): StreamPull = () =>
+  override def pull(onItem: T => (Async) ?=> Boolean): StreamPull = () =>
     boundary:
       while true do
         readStream() match
           case Left(terminated) =>
-            onTermination(terminated)
-            boundary.break(false)
-          case Right(item) => if !onItem(item) then boundary.break(true)
-      false
+            boundary.break(Some(terminated))
+          case Right(item) => if onItem(item) then boundary.break(None)
+      None
 
 trait StreamReader[+T]:
   /** Read an item from the channel, suspending until the item has been received.
     */
   def readStream()(using Async): StreamResult[T]
 
-  /** Create a persistent pull handle to extract data from this reader in an efficient manner. The handlers are never
-    * called asynchronously, but only as part of an invocation of the returned [[StreamPull]] (exactly one handle once
-    * per call).
+  /** Create a persistent pull handle to extract data from this reader in an efficient manner. The handler is never
+    * called asynchronously, but only as part of an invocation of the returned [[StreamPull]], and only until it returns
+    * true or the source is depleted. Exceptions thrown by the handler are forwarded.
     *
     * @param onItem
     *   a handler to be called when an element is available. Return false to request another element.
-    * @param onTermination
-    *   a handler to be called when the producer is terminated
     * @return
     *   a [[StreamPull]] handle to request data
     */
-  def pull(onItem: T => Async ?=> Boolean, onTermination: StreamResult.Terminated => Async ?=> Unit): StreamPull
+  def pull(onItem: T => Async ?=> Boolean): StreamPull
 
 trait ReadableStreamChannel[+T] extends StreamReader[T]:
   /** An [[Async.Source]] corresponding to items being sent over the channel. Note that *each* listener attached to and
@@ -278,7 +295,7 @@ class GenericStreamChannel[T](private val channel: Channel[StreamResult[T]]) ext
         value
     }
 
-  override def terminate(value: StreamResult.Terminated): Boolean =
+  override def terminate(value: StreamResult.Done): Boolean =
     val theValue = Left(value) // [[Failed]] contains useless generic
 
     closeLock.writeLock().lock()
@@ -344,9 +361,9 @@ object BufferedStreamChannel:
       else false
 
     override val readStreamSource: Async.Source[StreamResult[T]] =
-      readSource.transformValuesWith(_.orElse(finalResult).asInstanceOf[StreamResult[T]])
+      readSource.transformValuesWith(_.orElse(finalResult))
 
-    override def terminate(value: StreamResult.Terminated): Boolean = synchronized:
+    override def terminate(value: StreamResult.Done): Boolean = synchronized:
       if finalResult == null then
         finalResult = Left(value)
         cells.cancel()

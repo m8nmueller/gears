@@ -8,6 +8,8 @@ import gears.async.Listener
 import gears.async.Listener.ListenerLock
 import gears.async.SourceUtil
 import gears.async.Future
+import gears.async.ChannelClosedException
+import gears.async.CancellationException
 
 /** A source should provide means for parallel execution. As the execution is driven by the consumer, the consumer tells
   * the producer the degree of parallelism (see [[PullReaderStream.runWithReader]]) and the producer decides whether its
@@ -39,24 +41,52 @@ trait PullReaderStream[+T]:
       with PullLayers.FilterLayer.FilterLayer(test)
       with PullLayers.FromReaderLayer(this)
 
+  /** Transform this pull stream into a push stream by introducing an active component that pulls items, possibly
+    * transforms them, and pushes them downstream.
+    *
+    * @param parallelism
+    *   The number of task instances that are spawned. The actual number may be limited by sender/reader capabilities.
+    * @param task
+    *   The task to operate on the reader (to pull from this stream) and the sender which consumes the created stream's
+    *   output. It may throw a [[StreamResult.StreamTerminatedException]] to stop parallel executions of the same task
+    *   without further side effects. Any other exception will cancel (parallel) execution and bubble up.
+    * @return
+    *   a new push stream where elements emitted by the task will be sent to
+    */
   def pushedBy[V](parallelism: Int)(task: (StreamReader[T], StreamSender[V]) => Async ?=> Unit): PushSenderStream[V] =
     require(parallelism > 0)
     new PushSenderStream[V]:
       override def runToSender(senders: PushDestination[StreamSender, V])(using Async): Unit =
         runWithReader(parallelism): readers =>
-          if parallelism == 1 then
-            val r = handleMaybeIt(readers)(identity)(_.next)
-            val s = handleMaybeIt(senders)(identity)(_.next)
-            task(r, s)
-          else
-            val ri = handleMaybeIt(readers)(Iterator.continually)(identity)
-            val si = handleMaybeIt(senders)(Iterator.continually)(identity)
-            Async.group:
-              (ri zip si).take(parallelism).map { (r, s) => Future(task(r, s)) }.foreach(_.await)
+          try
+            if parallelism == 1 then
+              val r = handleMaybeIt(readers)(identity)(_.next)
+              val s = handleMaybeIt(senders)(identity)(_.next)
+              task(r, s)
+            else
+              val ri = handleMaybeIt(readers)(Iterator.continually)(identity)
+              val si = handleMaybeIt(senders)(Iterator.continually)(identity)
+              Async.group:
+                (ri zip si).take(parallelism).map { (r, s) => Future(task(r, s)) }.foreach(_.await)
+          catch case _: StreamResult.StreamTerminatedException => {} // main goal: to cancel Async.group
 
   def pushed(parallelism: Int): PushSenderStream[T] = pushedBy(parallelism): (reader, sender) =>
-    val handle = reader.pull(it => { sender.send(it); true }, sender.terminate)
-    while handle() do {}
+    val handle = reader.pull(it => { sender.send(it); true })
+    var result: Option[StreamResult.Done] = None
+
+    // The Cancellation Alphabet
+    // case (1) upstream returns termination / (2) downstream throws
+    // case (A) semi-terminal (closed) / (B) terminal (terminated or with Throwable cause)
+
+    try
+      while result.isEmpty do result = handle()
+      sender.terminate(result.get) // in case (1) --> notify downstream
+
+      result.get match // case (1B) --> interrupt stream operation
+        case t: Throwable               => throw StreamResult.StreamTerminatedException(t)
+        case _: StreamResult.Terminated => throw StreamResult.StreamTerminatedException()
+        case _                          => {} // case (1A) --> just stop this single task silently
+    catch case _: ChannelClosedException => {} // case (2A) --> just stop silently, but case (2B) goes up to interrupt
 
 trait PullChannelStream[+T] extends PullReaderStream[T]:
   /** @see
@@ -107,10 +137,7 @@ private object PullLayers:
     trait ReaderLayer[T, V] extends StreamReader[V]:
       self: FromReader[T] with MapLayer[T, V] =>
       override def readStream()(using Async): StreamResult[V] = upstream.readStream().map(mapper)
-      override def pull(
-          onItem: V => (Async) ?=> Boolean,
-          onTermination: StreamResult.Terminated => (Async) ?=> Unit
-      ): StreamPull = upstream.pull(onItem.compose(mapper), onTermination)
+      override def pull(onItem: V => (Async) ?=> Boolean): StreamPull = upstream.pull(onItem.compose(mapper))
 
     trait ChannelLayer[T, V] extends ReadableStreamChannel[V]:
       self: FromChannel[T] with MapLayer[T, V] =>
@@ -138,10 +165,8 @@ private object PullLayers:
         // only continue if is right (item) and that item does not match the filter
         while data.exists(item => !filter(item)) do data = upstream.readStream()
         data
-      override def pull(
-          onItem: T => (Async) ?=> Boolean,
-          onTermination: StreamResult.Terminated => (Async) ?=> Unit
-      ): StreamPull = upstream.pull(item => filter(item) && onItem(item), onTermination)
+      override def pull(onItem: T => (Async) ?=> Boolean): StreamPull =
+        upstream.pull(item => filter(item) && onItem(item))
 
     trait ChannelLayer[T] extends ReadableStreamChannel[T]:
       self: FromChannel[T] with FilterLayer[T] =>

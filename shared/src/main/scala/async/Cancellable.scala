@@ -1,5 +1,7 @@
 package gears.async
 
+import java.io.Closeable
+
 /** A trait for cancellable entities that can be grouped. */
 trait Cancellable:
 
@@ -40,4 +42,18 @@ object Cancellable:
         cancelled = true
 
       def isCancelled = cancelled
+
+  /** Create a [[Cancellable]] that, once cancelled, forwards the request to [[Closeable.close]]. It is assumed that
+    * closing succeeds synchronously, thus the [[Cancellable]] unlinks itself immediately afterwards.
+    *
+    * @param closeable
+    *   the closeable to wrap
+    * @return
+    *   a cancellable wrapper for the closeable
+    */
+  def fromCloseable(closeable: Closeable): Cancellable =
+    new Cancellable:
+      override def cancel(): Unit =
+        closeable.close()
+        this.unlink()
 end Cancellable

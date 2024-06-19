@@ -124,13 +124,13 @@ object SendableStreamChannel:
       private var closed = false
 
       override def sendSource(x: T): Async.Source[Res[Unit]] =
-        SourceUtil.addExternalLock(sendSrc(x), closeLock.readLock()) { (k, selfSrc) =>
-          if closed then
-            closeLock.readLock().unlock()
-            k.complete(Left(Channel.Closed), selfSrc)
-            false
-          else true
-        }
+        new SourceUtil.ExternalLockedSource(sendSrc(x), closeLock.readLock()):
+          override def lockedCheck(k: Listener[Res[Unit]]): Boolean =
+            if closed then
+              closeLock.readLock().unlock()
+              k.complete(Left(Channel.Closed), this)
+              false
+            else true
 
       override def terminate(value: StreamResult.Done): Boolean =
         closeLock.writeLock().lock()
@@ -276,13 +276,13 @@ class GenericStreamChannel[T](private val channel: Channel[StreamResult[T]]) ext
     //  - we are sending the termination message right now (only done once if justTerminated in terminate).
     // If we try to lock a non-termination-sender after termination, the lock attempt by src is rejected
     //    and the downstream listener k is completed with a Left(Closed).
-    SourceUtil.addExternalLock(channel.sendSource(result), closeLock.readLock()) { (k, selfSrc) =>
-      if finalResult != null && result.isRight then
-        closeLock.readLock().unlock()
-        k.complete(Left(Channel.Closed), selfSrc) // k.lock is already acquired or not existent (checked in SourceUtil)
-        false
-      else true
-    }
+    new SourceUtil.ExternalLockedSource(channel.sendSource(result), closeLock.readLock()):
+      override def lockedCheck(k: Listener[Res[Unit]]): Boolean =
+        if finalResult != null && result.isRight then
+          closeLock.readLock().unlock()
+          k.complete(Left(Channel.Closed), this) // k.lock is already acquired or not existent (checked in SourceUtil)
+          false
+        else true
     // note: a send-attached Listener may learn about a successful send possibly after the send-end has been closed
 
   override def sendSource(x: T): Async.Source[Res[Unit]] = sendSource0(Right(x))

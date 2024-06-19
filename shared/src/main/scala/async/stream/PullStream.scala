@@ -1,12 +1,14 @@
 package gears.async.stream
 
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.Lock
+import java.util.concurrent.locks.ReentrantLock
 import gears.async.Async
 import gears.async.Channel
 import gears.async.SourceUtil
 import gears.async.stream.StreamResult.StreamResult
 import gears.async.Listener
 import gears.async.Listener.ListenerLock
-import gears.async.SourceUtil
 import gears.async.Future
 import gears.async.ChannelClosedException
 import gears.async.CancellationException
@@ -39,6 +41,11 @@ trait PullReaderStream[+T]:
   def filter(test: T => Boolean): PullReaderStream[T] =
     new PullLayers.FilterLayer.ReaderMixer[T]
       with PullLayers.FilterLayer.FilterLayer(test)
+      with PullLayers.FromReaderLayer(this)
+
+  def take(count: Int): PullReaderStream[T] =
+    new PullLayers.TakeLayer.ReaderMixer[T]
+      with PullLayers.TakeLayer.TakeLayer(count)
       with PullLayers.FromReaderLayer(this)
 
   /** Transform this pull stream into a push stream by introducing an active component that pulls items, possibly
@@ -104,6 +111,11 @@ trait PullChannelStream[+T] extends PullReaderStream[T]:
   override def filter(test: T => Boolean): PullChannelStream[T] =
     new PullLayers.FilterLayer.ChannelMixer[T]
       with PullLayers.FilterLayer.FilterLayer(test)
+      with PullLayers.FromChannelLayer(this)
+
+  override def take(count: Int): PullChannelStream[T] =
+    new PullLayers.TakeLayer.ChannelMixer[T]
+      with PullLayers.TakeLayer.TakeLayer(count)
       with PullLayers.FromChannelLayer(this)
 
 private object PullLayers:
@@ -213,4 +225,103 @@ private object PullLayers:
       override def transform(channel: ReadableStreamChannel[T]): ReadableStreamChannel[T] =
         new ChannelLayer[T] with ReaderLayer[T] with PullLayers.FromChannel[T](channel) with FilterLayer[T](filter)
   end FilterLayer
+
+  object TakeLayer:
+    trait TakeLayer(val count: Int)
+
+    // can never know whether readStream() item result is already consumed (happens after return) -> do not terminate
+    abstract class ReaderLayer[T](remaining: AtomicInteger) extends StreamReader[T]:
+      self: FromReader[T] =>
+
+      override def pull(onItem: T => (Async) ?=> Boolean): StreamPull =
+        val handle = upstream.pull: item =>
+          if remaining.getAndDecrement() > 0 then onItem(item)
+          else
+            remaining.set(0)
+            true
+
+        () => if remaining.get() > 0 then handle() else Some(StreamResult.Closed)
+
+      override def readStream()(using Async): StreamResult[T] =
+        if remaining.get() > 0 then
+          val result = upstream.readStream()
+          if result.isRight then
+            if remaining.getAndDecrement() > 0 then result
+            else
+              remaining.set(0)
+              Left(StreamResult.Closed)
+          else result
+        else Left(StreamResult.Closed)
+    end ReaderLayer
+
+    class ChannelCounter(var remaining: Int)
+
+    abstract class ChannelLayer[T](counter: ChannelCounter, lock: Lock) extends ReadableStreamChannel[T]:
+      self: FromChannel[T] =>
+      override val readStreamSource: Async.Source[StreamResult[T]] =
+        new SourceUtil.ExternalLockedSource(upstream.readStreamSource, lock):
+          override def lockedCheck(k: Listener[StreamResult[T]]): Boolean =
+            if counter.remaining > 0 then true
+            else
+              lock.unlock()
+              k.complete(Left(StreamResult.Closed), this)
+              false
+
+          override def complete(
+              k: Listener.ForwardingListener[StreamResult[T]],
+              data: StreamResult[T],
+              source: Async.Source[StreamResult[T]]
+          ): Unit =
+            counter.remaining -= 1
+            super.complete(k, data, source)
+
+      override def pull(onItem: T => (Async) ?=> Boolean): StreamPull =
+        val handle = upstream.pull: item =>
+          lock.lock()
+          val doPass = if counter.remaining > 0 then
+            counter.remaining -= 1
+            true
+          else false
+          lock.unlock()
+
+          if doPass then onItem(item) else true
+
+        () => if counter.remaining > 0 then handle() else Some(StreamResult.Closed)
+
+      override def readStream()(using Async): StreamResult[T] =
+        if counter.remaining > 0 then
+          val result = upstream.readStream()
+          if result.isRight then
+            lock.lock()
+            val doReturn = if counter.remaining > 0 then
+              counter.remaining -= 1
+              true
+            else false
+            lock.unlock()
+
+            if doReturn then result else Left(StreamResult.Closed)
+          else result
+        else Left(StreamResult.Closed)
+
+    trait ReaderMixer[T] extends PullReaderStream[T]:
+      self: FromReaderLayer[T] with TakeLayer =>
+      override def runWithReader[A](parallelism: Int)(body: PullSource[StreamReader, T] => (Async) ?=> A)(using
+          Async
+      ): A =
+        val remaining = AtomicInteger(count)
+        upstream.runWithReader(parallelism)(
+          body.compose(mapMaybeIt(_)(reader => new ReaderLayer[T](remaining) with FromReader(reader)))
+        )
+
+    trait ChannelMixer[T] extends PullChannelStream[T]:
+      self: FromChannelLayer[T] with TakeLayer =>
+      override def runWithChannel[A](parallelism: Int)(body: PullSource[ReadableStreamChannel, T] => (Async) ?=> A)(
+          using Async
+      ): A =
+        val counter = ChannelCounter(count)
+        val lock = ReentrantLock()
+        upstream.runWithChannel(parallelism)(
+          body.compose(mapMaybeIt(_)(ch => new ChannelLayer[T](counter, lock) with FromChannel(ch)))
+        )
+  end TakeLayer
 end PullLayers

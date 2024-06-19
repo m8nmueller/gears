@@ -1,10 +1,15 @@
 package gears.async.stream
 
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.Lock
+import java.util.concurrent.locks.ReentrantLock
 import gears.async.Async
 import gears.async.Channel
 import gears.async.Listener
 import gears.async.Future
 import gears.async.Cancellable
+import gears.async.SourceUtil
+import gears.async.ChannelClosedException
 
 /** A destination can either be a single Sender or a factory. If it is a factory, the producer should create a new
   * instance for every parallel execution. A termination/intermediary step might decide it's sender logic is not
@@ -27,6 +32,11 @@ trait PushSenderStream[+T] extends PushChannelStream[T]:
   override def filter(test: T => Boolean): PushSenderStream[T] =
     new PushLayers.FilterLayer.SenderMixer[T]
       with PushLayers.FilterLayer.FilterLayer(test)
+      with PushLayers.FromSenderLayer(this)
+
+  override def take(count: Int): PushSenderStream[T] =
+    new PushLayers.TakeLayer.SenderMixer[T]
+      with PushLayers.TakeLayer.TakeLayer(count)
       with PushLayers.FromSenderLayer(this)
 
 trait PushChannelStream[+T]:
@@ -65,6 +75,11 @@ trait PushChannelStream[+T]:
 
         Future { runToChannel(channel) } // ignore result/exception as this is handled by stream termination
         body(channel)
+
+  def take(count: Int): PushChannelStream[T] =
+    new PushLayers.TakeLayer.ChannelMixer[T]
+      with PushLayers.TakeLayer.TakeLayer(count)
+      with PushLayers.FromChannelLayer(this)
 
 private object PushLayers:
   // helpers for generating the layer ("mixer") traits (for derived streams)
@@ -153,4 +168,77 @@ private object PushLayers:
       override def transform(channel: SendableStreamChannel[T]): SendableStreamChannel[T] =
         new ChannelLayer[T] with SenderLayer[T] with FilterLayer(filter) with ToChannel(channel)
   end FilterLayer
+
+  object TakeLayer:
+    trait TakeLayer(val count: Int)
+
+    abstract class SenderLayer[T](remaining: AtomicInteger, remainingSent: AtomicInteger) extends ForwardTerminate[T]:
+      self: ToSender[T] =>
+
+      override def send(x: T)(using Async): Unit =
+        if remaining.getAndDecrement() > 0 then
+          downstream.send(x)
+          if remainingSent.getAndDecrement() == 1 then downstream.terminate(StreamResult.Terminated)
+        else
+          remaining.set(0)
+          throw ChannelClosedException() // parallel send may be running -> do not terminate fully
+
+    class ChannelCounter(var remaining: Int)
+
+    abstract class ChannelLayer[T](counter: ChannelCounter, sentCounter: AtomicInteger, lock: Lock)
+        extends SendableStreamChannel[T]
+        with ForwardTerminate[T]:
+      self: ToChannel[T] =>
+
+      // this will evaluate sendSource code (i.e., possibly expensive mappers) even if element won't be sent
+      override def sendSource(x: T): Async.Source[Channel.Res[Unit]] =
+        new SourceUtil.ExternalLockedSource(downstream.sendSource(x), lock):
+          override def lockedCheck(k: Listener[Channel.Res[Unit]]): Boolean =
+            if counter.remaining > 0 then true
+            else
+              lock.unlock()
+              k.complete(Left(Channel.Closed), this)
+              false
+
+          override def complete(
+              k: Listener.ForwardingListener[Channel.Res[Unit]],
+              data: Channel.Res[Unit],
+              source: Async.Source[Channel.Res[Unit]]
+          ): Unit =
+            counter.remaining -= 1
+            super.complete(k, data, source)
+            if sentCounter.getAndDecrement() == 1 then downstream.terminate(StreamResult.Terminated)
+
+      override def send(x: T)(using Async): Unit =
+        lock.lock()
+        val doSend = if counter.remaining > 0 then
+          counter.remaining -= 1
+          true
+        else false
+        lock.unlock()
+
+        if doSend then
+          downstream.send(x)
+          if sentCounter.getAndDecrement() == 1 then downstream.terminate(StreamResult.Terminated)
+        else if sentCounter.get() == 0 then throw StreamResult.StreamTerminatedException()
+        else throw ChannelClosedException() // still parallel sends running -> don't cancel them
+    end ChannelLayer
+
+    trait SenderMixer[T] extends PushSenderStream[T]:
+      self: FromSenderLayer[T] with TakeLayer =>
+      override def runToSender(sender: PushDestination[StreamSender, T])(using Async): Unit =
+        val remaining = AtomicInteger(count)
+        val remainingSent = AtomicInteger(count)
+        upstream.runToSender(mapMaybeIt(sender)(s => new SenderLayer[T](remaining, remainingSent) with ToSender(s)))
+
+    trait ChannelMixer[T] extends PushChannelStream[T]:
+      self: FromChannelLayer[T] with TakeLayer =>
+      override def runToChannel(channel: PushDestination[SendableStreamChannel, T])(using Async): Unit =
+        val counter = ChannelCounter(count)
+        val sentCounter = AtomicInteger(count)
+        val lock = ReentrantLock()
+        upstream.runToChannel(
+          mapMaybeIt(channel)(c => new ChannelLayer[T](counter, sentCounter, lock) with ToSender(c))
+        )
+  end TakeLayer
 end PushLayers

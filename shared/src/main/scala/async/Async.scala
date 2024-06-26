@@ -95,21 +95,48 @@ object Async:
   def group[T](body: Async.Spawn ?=> T)(using Async): T =
     withNewCompletionGroup(CompletionGroup().link())(body)
 
+  private def cancelAndWaitGroup(group: CompletionGroup)(using async: Async) =
+    val completionAsync =
+      if CompletionGroup.Unlinked == async.group
+      then async
+      else async.withGroup(CompletionGroup.Unlinked)
+    group.cancel()
+    group.waitCompletion()(using completionAsync)
+
   /** Runs a body within another completion group. When the body returns, the group is cancelled and its completion
     * awaited with the `Unlinked` group.
     */
   private[async] def withNewCompletionGroup[T](group: CompletionGroup)(body: Async.Spawn ?=> T)(using
       async: Async
   ): T =
-    val completionAsync =
-      if CompletionGroup.Unlinked == async.group
-      then async
-      else async.withGroup(CompletionGroup.Unlinked)
-
     try body(using async.withGroup(group))
-    finally
-      group.cancel()
-      group.waitCompletion()(using completionAsync)
+    finally cancelAndWaitGroup(group)(using async)
+
+  /** A Resource that grants access to the [[Spawn]] capability. On cleanup, every spawned [[Future]] is cancelled and
+    * awaited, similar to [[Async.group]].
+    *
+    * Note that the [[Spawn]] from the resource should not be used after allocation.
+    */
+  val spawning = new Resource[Spawn]:
+    self =>
+    override def use[V](body: Spawn => (Async) ?=> V)(using Async): V = group(spawn ?=> body(spawn)(using spawn))
+    override def allocated(using allocAsync: Async): (Spawn, (Async) ?=> Unit) =
+      val group = CompletionGroup() // not linked to allocAsync's group because it would not unlink itself
+      (allocAsync.withGroup(group), closeAsync ?=> cancelAndWaitGroup(group)(using closeAsync))
+
+    override def map[Q](fn: Spawn => (Async) ?=> Q): Resource[Q] = new Resource[Q]:
+      override def use[V](body: Q => (Async) ?=> V)(using Async): V =
+        group(spawn ?=> body(fn(spawn)(using spawn))(using spawn))
+      override def allocated(using Async): (Q, (Async) ?=> Unit) =
+        val (spawn, close) = self.allocated
+        var failed = true
+        try
+          val mapped = fn(spawn)(using spawn) // this is why map is overridden: consistency in using the spawn
+          failed = false
+          (mapped, close)
+        finally if failed then close
+      override def map[U](fn2: Q => (Async) ?=> U): Resource[U] = self.map(spawn => fn2(fn(spawn)))
+  end spawning
 
   /** An asynchronous data source. Sources can be persistent or ephemeral. A persistent source will always pass same
     * data to calls of [[Source!.poll]] and [[Source!.onComplete]]. An ephemeral source can pass new data in every call.

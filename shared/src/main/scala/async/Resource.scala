@@ -14,9 +14,9 @@ trait Resource[+T]:
     *   the result of [[body]]
     */
   def use[V](body: T => Async ?=> V)(using Async): V =
-    val (res, close) = allocated
-    try body(res)
-    finally close
+    val res = allocated
+    try body(res._1)
+    finally res._2
 
   /** Allocate the resource and leak it. **Use with caution**. The programmer is responsible for closing the resource
     * with the returned handle.
@@ -36,13 +36,13 @@ trait Resource[+T]:
   def map[U](fn: T => Async ?=> U): Resource[U] = new Resource[U]:
     override def use[V](body: U => (Async) ?=> V)(using Async): V = self.use(t => body(fn(t)))
     override def allocated(using Async): (U, (Async) ?=> Unit) =
-      val (res, close) = self.allocated
+      val res = self.allocated
       var failed = true
       try
-        val mapped = fn(res)
+        val mapped = fn(res._1)
         failed = false // don't clean up
-        (mapped, close)
-      finally if failed then close
+        (mapped, res._2)
+      finally if failed then res._2
     override def map[Q](fn2: U => (Async) ?=> Q): Resource[Q] = self.map(t => fn2(fn(t)))
 end Resource
 

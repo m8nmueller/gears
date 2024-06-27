@@ -128,13 +128,13 @@ object Async:
       override def use[V](body: Q => (Async) ?=> V)(using Async): V =
         group(spawn ?=> body(fn(spawn)(using spawn))(using spawn))
       override def allocated(using Async): (Q, (Async) ?=> Unit) =
-        val (spawn, close) = self.allocated
+        val res = self.allocated
         var failed = true
         try
-          val mapped = fn(spawn)(using spawn) // this is why map is overridden: consistency in using the spawn
+          val mapped = fn(res._1)(using res._1) // this is why map is overridden: consistency in using the spawn
           failed = false
-          (mapped, close)
-        finally if failed then close
+          (mapped, res._2)
+        finally if failed then res._2
       override def map[U](fn2: Q => (Async) ?=> U): Resource[U] = self.map(spawn => fn2(fn(spawn)))
   end spawning
 

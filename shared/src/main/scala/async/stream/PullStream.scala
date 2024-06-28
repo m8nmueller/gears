@@ -1,37 +1,38 @@
 package gears.async.stream
 
+import gears.async.Async
+import gears.async.CancellationException
+import gears.async.Channel
+import gears.async.ChannelClosedException
+import gears.async.Future
+import gears.async.Listener
+import gears.async.Listener.ListenerLock
+import gears.async.Resource
+import gears.async.SourceUtil
+import gears.async.stream.StreamResult.StreamResult
+
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.Lock
 import java.util.concurrent.locks.ReentrantLock
-import gears.async.Async
-import gears.async.Channel
-import gears.async.SourceUtil
-import gears.async.stream.StreamResult.StreamResult
-import gears.async.Listener
-import gears.async.Listener.ListenerLock
-import gears.async.Future
-import gears.async.ChannelClosedException
-import gears.async.CancellationException
 
 /** A source should provide means for parallel execution. As the execution is driven by the consumer, the consumer tells
   * the producer the degree of parallelism (see [[PullReaderStream.runWithReader]]) and the producer decides whether its
-  * readers are thread-safe. If they are, it may pass a single reader. Otherwise, it passes a factory for sources that
-  * will only be employed on one thread.
+  * readers are thread-safe. If they are, it may return a single reader. Otherwise, it returns a factory for sources
+  * that will only be employed on one thread.
   */
 type PullSource[+S[+_], +T] = S[T] | Iterator[S[T]]
 
 trait PullReaderStream[+T]:
-  /** Run the reader stream by creating one/multiple readers and passing it to the receiving body. Computation is
-    * terminated once the body returns.
+  /** Create a resource of readers that can be used to retrieve the stream data. The stream can use this function to set
+    * up, but asynchronous tasks and item processing should (and can) only be started when the returned resource is
+    * acquired by the consumer.
     *
     * @param parallelism
     *   the number of reader instances that the receiver requests for concurrent access
-    * @param body
-    *   the receiver body that runs on the readers
     * @return
-    *   the result of the body
+    *   the resource that wraps the stream readers
     */
-  def runWithReader[A](parallelism: Int)(body: PullSource[StreamReader, T] => Async ?=> A)(using Async): A
+  def toReader(parallelism: Int)(using Async): Resource[PullSource[StreamReader, T]]
 
   def map[V](mapper: T => V): PullReaderStream[V] =
     new PullLayers.MapLayer.ReaderMixer[T, V]
@@ -64,7 +65,7 @@ trait PullReaderStream[+T]:
     require(parallelism > 0)
     new PushSenderStream[V]:
       override def runToSender(senders: PushDestination[StreamSender, V])(using Async): Unit =
-        runWithReader(parallelism): readers =>
+        toReader(parallelism).use: readers =>
           try
             if parallelism == 1 then
               val r = handleMaybeIt(readers)(identity)(_.next)
@@ -97,11 +98,10 @@ trait PullReaderStream[+T]:
 
 trait PullChannelStream[+T] extends PullReaderStream[T]:
   /** @see
-    *   PullReaderStream.runWithReader
+    *   PullReaderStream.toReader
     */
-  def runWithChannel[A](parallelism: Int)(body: PullSource[ReadableStreamChannel, T] => Async ?=> A)(using Async): A
-  override def runWithReader[A](parallelism: Int)(body: PullSource[StreamReader, T] => Async ?=> A)(using Async): A =
-    runWithChannel(parallelism)(body)
+  def toChannel(parallelism: Int)(using Async): Resource[PullSource[ReadableStreamChannel, T]]
+  override def toReader(parallelism: Int)(using Async): Resource[PullSource[StreamReader, T]] = toChannel(parallelism)
 
   override def map[V](mapper: T => V): PullChannelStream[V] =
     new PullLayers.MapLayer.ChannelMixer[T, V]
@@ -132,16 +132,14 @@ private object PullLayers:
   trait ReaderMixer[T, V] extends PullReaderStream[V]:
     self: FromReaderLayer[T] =>
     def transform(reader: StreamReader[T]): StreamReader[V]
-    override def runWithReader[A](parallelism: Int)(body: PullSource[StreamReader, V] => Async ?=> A)(using Async): A =
-      upstream.runWithReader(parallelism) { inReader => body(mapMaybeIt(inReader)(transform)) }
+    override def toReader(parallelism: Int)(using Async): Resource[PullSource[StreamReader, V]] =
+      upstream.toReader(parallelism).map(mapMaybeIt(_)(transform))
 
   trait ChannelMixer[T, V] extends PullChannelStream[V]:
     self: FromChannelLayer[T] =>
     def transform(channel: ReadableStreamChannel[T]): ReadableStreamChannel[V]
-    override def runWithChannel[A](parallelism: Int)(body: PullSource[ReadableStreamChannel, V] => Async ?=> A)(using
-        Async
-    ): A =
-      upstream.runWithChannel(parallelism) { inChannel => body(mapMaybeIt(inChannel)(transform)) }
+    override def toChannel(parallelism: Int)(using Async): Resource[PullSource[ReadableStreamChannel, V]] =
+      upstream.toChannel(parallelism).map(mapMaybeIt(_)(transform))
 
   object MapLayer:
     trait MapLayer[T, V](val mapper: T => V)
@@ -305,23 +303,19 @@ private object PullLayers:
 
     trait ReaderMixer[T] extends PullReaderStream[T]:
       self: FromReaderLayer[T] with TakeLayer =>
-      override def runWithReader[A](parallelism: Int)(body: PullSource[StreamReader, T] => (Async) ?=> A)(using
-          Async
-      ): A =
+      override def toReader(parallelism: Int)(using Async): Resource[PullSource[StreamReader, T]] =
         val remaining = AtomicInteger(count)
-        upstream.runWithReader(parallelism)(
-          body.compose(mapMaybeIt(_)(reader => new ReaderLayer[T](remaining) with FromReader(reader)))
-        )
+        upstream
+          .toReader(parallelism)
+          .map(mapMaybeIt(_)(reader => new ReaderLayer[T](remaining) with FromReader(reader)))
 
     trait ChannelMixer[T] extends PullChannelStream[T]:
       self: FromChannelLayer[T] with TakeLayer =>
-      override def runWithChannel[A](parallelism: Int)(body: PullSource[ReadableStreamChannel, T] => (Async) ?=> A)(
-          using Async
-      ): A =
+      override def toChannel(parallelism: Int)(using Async): Resource[PullSource[ReadableStreamChannel, T]] =
         val counter = ChannelCounter(count)
         val lock = ReentrantLock()
-        upstream.runWithChannel(parallelism)(
-          body.compose(mapMaybeIt(_)(ch => new ChannelLayer[T](counter, lock) with FromChannel(ch)))
-        )
+        upstream
+          .toChannel(parallelism)
+          .map(mapMaybeIt(_)(ch => new ChannelLayer[T](counter, lock) with FromChannel(ch)))
   end TakeLayer
 end PullLayers

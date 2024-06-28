@@ -1,15 +1,17 @@
 package gears.async.stream
 
+import gears.async.Async
+import gears.async.Cancellable
+import gears.async.Channel
+import gears.async.ChannelClosedException
+import gears.async.Future
+import gears.async.Listener
+import gears.async.Resource
+import gears.async.SourceUtil
+
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.Lock
 import java.util.concurrent.locks.ReentrantLock
-import gears.async.Async
-import gears.async.Channel
-import gears.async.Listener
-import gears.async.Future
-import gears.async.Cancellable
-import gears.async.SourceUtil
-import gears.async.ChannelClosedException
 
 /** A destination can either be a single Sender or a factory. If it is a factory, the producer should create a new
   * instance for every parallel execution. A termination/intermediary step might decide it's sender logic is not
@@ -63,18 +65,15 @@ trait PushChannelStream[+T]:
     *   BufferedStreamChannel
     */
   def pulledThrough(bufferSize: Int): PullChannelStream[T] = new PullChannelStream[T]:
-    override def runWithChannel[A](parallelism: Int)(body: PullSource[ReadableStreamChannel, T] => Async ?=> A)(using
-        Async
-    ): A =
-      // the channel is thread-safe -> the consumer may use it from multiple threads
-      val channel = BufferedStreamChannel[T](bufferSize)
+    override def toChannel(parallelism: Int)(using Async): Resource[PullSource[ReadableStreamChannel, T]] =
+      Resource.spawning:
+        val channel = BufferedStreamChannel[T](bufferSize)
 
-      Async.group:
         // speeds up stream cancellation when body returns because channels do not check for cancellation unless full
         Cancellable.fromCloseable(channel).link()
 
         Future { runToChannel(channel) } // ignore result/exception as this is handled by stream termination
-        body(channel)
+        channel // the channel is thread-safe -> the consumer may use it from multiple threads
 
   def take(count: Int): PushChannelStream[T] =
     new PushLayers.TakeLayer.ChannelMixer[T]

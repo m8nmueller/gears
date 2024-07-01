@@ -118,25 +118,10 @@ object Async:
     * Note that the [[Spawn]] from the resource should not be used after allocation.
     */
   val spawning = new Resource[Spawn]:
-    self =>
-    override def use[V](body: Spawn => (Async) ?=> V)(using Async): V = group(spawn ?=> body(spawn)(using spawn))
+    override def use[V](body: Spawn => (Async) ?=> V)(using a: Async): V = group(spawn ?=> body(spawn)(using a))
     override def allocated(using allocAsync: Async): (Spawn, (Async) ?=> Unit) =
       val group = CompletionGroup() // not linked to allocAsync's group because it would not unlink itself
       (allocAsync.withGroup(group), closeAsync ?=> cancelAndWaitGroup(group)(using closeAsync))
-
-    override def map[Q](fn: Spawn => (Async) ?=> Q): Resource[Q] = new Resource[Q]:
-      override def use[V](body: Q => (Async) ?=> V)(using Async): V =
-        group(spawn ?=> body(fn(spawn)(using spawn))(using spawn))
-      override def allocated(using Async): (Q, (Async) ?=> Unit) =
-        val res = self.allocated
-        var failed = true
-        try
-          val mapped = fn(res._1)(using res._1) // this is why map is overridden: consistency in using the spawn
-          failed = false
-          (mapped, res._2)
-        finally if failed then res._2
-      override def map[U](fn2: Q => (Async) ?=> U): Resource[U] = self.map(spawn => fn2(fn(spawn)))
-  end spawning
 
   /** An asynchronous data source. Sources can be persistent or ephemeral. A persistent source will always pass same
     * data to calls of [[Source!.poll]] and [[Source!.onComplete]]. An ephemeral source can pass new data in every call.

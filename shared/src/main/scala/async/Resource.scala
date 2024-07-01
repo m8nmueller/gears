@@ -44,6 +44,31 @@ trait Resource[+T]:
         (mapped, res._2)
       finally if failed then res._2
     override def map[Q](fn2: U => (Async) ?=> Q): Resource[Q] = self.map(t => fn2(fn(t)))
+
+  /** Create a derived resource that creates a inner resource from the resource data. The inner resource will be
+    * acquired simultaneously, thus it can both transform the resource data and add a new cleanup action.
+    *
+    * @param fn
+    *   a function that creates an inner resource
+    * @return
+    *   the transformed resource that provides the two-levels-in-one access
+    */
+  def flatMap[U](fn: T => Async ?=> Resource[U]): Resource[U] = new Resource[U]:
+    override def use[V](body: U => (Async) ?=> V)(using Async): V = self.use(t => fn(t).use(body))
+    override def allocated(using Async): (U, (Async) ?=> Unit) =
+      val res = self.allocated
+      var failed = true
+      try
+        val mapped = fn(res._1).allocated
+        if mapped != null then failed = false // don't clean up (null with provoke NullPtrE, undefined but caught)
+        (
+          mapped._1,
+          { closeAsync ?=>
+            try mapped._2(using closeAsync) // close inner first
+            finally res._2(using closeAsync) // then close second, even if first failed
+          }
+        )
+      finally if failed then res._2
 end Resource
 
 object Resource:

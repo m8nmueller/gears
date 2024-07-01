@@ -16,6 +16,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.Lock
 import java.util.concurrent.locks.ReentrantLock
+import scala.collection.mutable.ArrayBuffer
 
 /** A source should provide means for parallel execution. As the execution is driven by the consumer, the consumer tells
   * the producer the degree of parallelism (see [[PullReaderStream.runWithReader]]) and the producer decides whether its
@@ -376,7 +377,10 @@ private object PullLayers:
         innerParallelism: Int,
         mapper: T => PullReaderStream[V]
     ):
-      val innerCells = ConcurrentLinkedQueue[StreamCell[V]]()
+      @volatile var cancelled = false
+      val innerCells = ConcurrentLinkedQueue[StreamCell[V]]() // external use: peek() and remove(item)
+      private val linkedReaders = ArrayBuffer[ReaderLayer[T, V]]() // synchronized with its object monitor
+
       def this(outerParallelism: Int, innerParallelism: Int, mapper: T => PullReaderStream[V]) =
         this(Semaphore(outerParallelism), innerParallelism, mapper)
 
@@ -393,6 +397,9 @@ private object PullLayers:
             returnOuter(outer)
             val cell = StreamCell(mapper(value).toReader(innerParallelism), innerParallelism)
             this.innerCells.add(cell) // release semaphore only after added to innerCells to keep outerParallelism
+            if cancelled then
+              cell.releaseNow()
+              throw new IllegalStateException("using reader after resource released")
             cell
           case termination @ Left(result) =>
             returnOuter(null)
@@ -425,6 +432,32 @@ private object PullLayers:
           null // unreachable
         finally outerPullGuard.release()
       end acquireCell
+
+      def linkReader(reader: ReaderLayer[T, V]) =
+        linkedReaders.synchronized { linkedReaders.addOne(reader) }
+        if cancelled then throw new IllegalStateException("creating reader after resource released")
+
+      private def dropReader() =
+        linkedReaders.synchronized:
+          val s = linkedReaders.size
+          if s > 0 then linkedReaders.remove(s - 1) else null
+
+      def cancelAll()(using Async): Unit =
+        cancelled = true
+
+        // if new cells are added (only acquireFrom) : `cancelled` is checked afterwards
+        var cell = innerCells.poll()
+        while cell != null do
+          cell.releaseNow()
+          cell = innerCells.poll()
+
+        // if reader is added (only linkReader) : `cancelled` is checked afterwards
+        var reader = dropReader()
+        while reader != null do
+          cell = reader.cell
+          if cell != null then cell.releaseNow()
+          reader = dropReader()
+      end cancelAll
     end StreamContext
 
     class SingleStreamContext[T, V](
@@ -464,13 +497,19 @@ private object PullLayers:
       var cell: StreamCell[V] = null
       var reader: StreamReader[V] = null
 
+      ctx.linkReader(this) // link in constructor to dispose captured cell on cancellation
+
       private def acquireReader()(using Async): Boolean =
         if cell == null then cell = ctx.innerCells.peek()
         // reader = null
 
         while cell != null do
           reader = cell.acquire()
-          if reader != null then return true
+          if reader != null then
+            if ctx.cancelled then
+              cell.releaseNow()
+              throw new IllegalStateException("using reader after resource released")
+            return true
           else
             cell.onAcquireFailed()
             ctx.innerCells.remove(cell)
@@ -494,6 +533,7 @@ private object PullLayers:
                 cell.releaseTerminated()
                 if close.isInstanceOf[Throwable] then return res
         null // unreachable
+      end readStream
 
       // TODO how do to pull(handler): PullHandle? I don't know.
     end ReaderLayer
@@ -504,12 +544,12 @@ private object PullLayers:
         val effectiveOuter = outerParallelism.min(parallelism)
         upstream
           .toReader(effectiveOuter)
-          .map: upstreamSource =>
+          .flatMap: upstreamSource =>
             val innerParallelism = Math.ceilDiv(parallelism, effectiveOuter)
             val context = handleMaybeIt(upstreamSource)(
               SingleStreamContext(_, outerParallelism, innerParallelism, mapper)
             )(IteratorStreamContext(_, outerParallelism, innerParallelism, mapper))
-            Iterator.continually(ReaderLayer(context))
+            Resource(Iterator.continually(ReaderLayer(context)), { _ => context.cancelAll() })
 
   end FlatMapLayer
 end PullLayers
